@@ -30,7 +30,7 @@ pub trait Importer: Sized {
 
 #[async_trait]
 pub trait Loader: Sync + Send {
-    async fn push(&mut self, hist: History) -> eyre::Result<()>;
+    async fn push(&mut self, hist: History) -> Result<()>;
 }
 
 fn unix_byte_lines(input: &[u8]) -> impl Iterator<Item = &[u8]> {
@@ -73,7 +73,7 @@ fn get_histpath<D>(def: D) -> Result<PathBuf>
 where
     D: FnOnce() -> Result<PathBuf>,
 {
-    if let Ok(p) = std::env::var("HISTFILE") {
+    if let Ok(p) = atuin_common::env::var("HISTFILE") {
         Ok(PathBuf::from(p))
     } else {
         def()
@@ -104,20 +104,14 @@ fn is_file(p: PathBuf) -> Result<PathBuf> {
     if p.is_file() {
         Ok(p)
     } else {
-        bail!(
-            "Could not find history file {:?}. Try setting and exporting $HISTFILE",
-            p
-        )
+        bail!("Could not find history file {:?}. Try setting and exporting $HISTFILE", p);
     }
 }
 fn is_dir(p: PathBuf) -> Result<PathBuf> {
     if p.is_dir() {
         Ok(p)
     } else {
-        bail!(
-            "Could not find history directory {:?}. Try setting and exporting $HISTFILE",
-            p
-        )
+        bail!("Could not find history directory {:?}. Try setting and exporting $HISTFILE", p);
     }
 }
 

@@ -5,18 +5,23 @@
 //! - [`DaemonState`]: Shared state owned by the daemon
 //! - [`DaemonHandle`]: A lightweight, cloneable handle for accessing daemon state
 //! - [`Component`]: A trait for implementing daemon components
+//!   (dispatched over via the [`AnyComponent`] enum)
 //! - [`Daemon`]: The main daemon orchestrator
 //! - [`DaemonBuilder`]: Builder for constructing and configuring the daemon
 
 use std::sync::Arc;
 
-use atuin_client::{
-    database::Sqlite as HistoryDatabase, encryption, record::sqlite_store::SqliteStore,
-    settings::Settings,
-};
+use atuin_client::api_client::caps_client;
+use atuin_client::database::Sqlite as HistoryDatabase;
+use atuin_client::record::sqlite_store::SqliteStore;
+use atuin_client::settings::Settings;
+use atuin_common::encryption::paseto_v4;
+use atuin_domain::caps::CapClient;
+use enum_dispatch::enum_dispatch;
 use eyre::{Context, Result};
-use tokio::sync::{RwLock, broadcast};
+use tokio::sync::{RwLock, RwLockReadGuard, broadcast};
 
+use crate::components::SearchComponent;
 use crate::events::DaemonEvent;
 
 // ============================================================================
@@ -32,14 +37,17 @@ pub struct DaemonState {
     event_tx: broadcast::Sender<DaemonEvent>,
 
     // Configuration (mutable - can be reloaded)
-    settings: RwLock<Settings>,
+    settings: RwLock<Arc<Settings>>,
 
     // Encryption key (immutable - derived at startup)
-    encryption_key: [u8; 32],
+    encryption_key: paseto_v4::Key,
 
     // Database handles
     history_db: HistoryDatabase,
     store: SqliteStore,
+
+    // Reads the server's advertised capabilities (e.g. the packfile record count).
+    caps: Arc<CapClient>,
 }
 
 // ============================================================================
@@ -61,8 +69,8 @@ pub struct DaemonState {
 /// # Example
 ///
 /// ```ignore
-/// // Emit an event
-/// handle.emit(DaemonEvent::HistoryPruned);
+/// // Request a graceful shutdown
+/// handle.shutdown();
 ///
 /// // Access settings
 /// let settings = handle.settings().await;
@@ -94,6 +102,7 @@ impl DaemonHandle {
     /// Returns a receiver that will receive all events emitted after this call.
     /// Useful for components that need to listen for events outside of the
     /// normal `handle_event` callback flow.
+    #[must_use]
     pub fn subscribe(&self) -> broadcast::Receiver<DaemonEvent> {
         self.state.event_tx.subscribe()
     }
@@ -107,47 +116,48 @@ impl DaemonHandle {
 
     /// Get the current settings.
     ///
-    /// This acquires a read lock on the settings. For most use cases, clone
-    /// the settings if you need to hold onto them.
-    pub async fn settings(&self) -> tokio::sync::RwLockReadGuard<'_, Settings> {
+    /// This acquires a read lock on the settings. Clone the `Arc` if you
+    /// need to hold onto them.
+    pub async fn settings(&self) -> RwLockReadGuard<'_, Arc<Settings>> {
         self.state.settings.read().await
-    }
-
-    /// Reload settings from disk and emit a SettingsReloaded event.
-    ///
-    /// Components listening for `SettingsReloaded` can then re-read settings
-    /// via `handle.settings()` to pick up the changes.
-    pub async fn reload_settings(&self) -> Result<()> {
-        let new_settings = Settings::new()?;
-        self.apply_settings(new_settings).await;
-        Ok(())
     }
 
     /// Apply already-loaded settings and emit a SettingsReloaded event.
     ///
-    /// Use this when settings have already been loaded (e.g., from a file watcher)
-    /// to avoid parsing the config file twice.
-    pub async fn apply_settings(&self, settings: Settings) {
+    /// Components listening for `SettingsReloaded` can then re-read settings via
+    /// `handle.settings()` to pick up the changes.
+    pub async fn apply_settings(&self, settings: Arc<Settings>) {
         *self.state.settings.write().await = settings;
         self.emit(DaemonEvent::SettingsReloaded);
         tracing::info!("settings applied");
     }
 
     /// Get the encryption key.
-    pub fn encryption_key(&self) -> &[u8; 32] {
+    #[must_use]
+    pub fn encryption_key(&self) -> &paseto_v4::Key {
         &self.state.encryption_key
     }
 
     // ---- Database ----
 
     /// Get a reference to the history database.
+    #[must_use]
     pub fn history_db(&self) -> &HistoryDatabase {
         &self.state.history_db
     }
 
     /// Get a reference to the record store.
+    #[must_use]
     pub fn store(&self) -> &SqliteStore {
         &self.state.store
+    }
+
+    // ---- Capabilities ----
+
+    /// Get the capability reader for the configured sync server.
+    #[must_use]
+    pub fn caps(&self) -> &Arc<CapClient> {
+        &self.state.caps
     }
 }
 
@@ -185,7 +195,6 @@ impl std::fmt::Debug for DaemonHandle {
 ///     handle: Option<DaemonHandle>,
 /// }
 ///
-/// #[async_trait]
 /// impl Component for MyComponent {
 ///     fn name(&self) -> &'static str { "my-component" }
 ///
@@ -212,8 +221,9 @@ impl std::fmt::Debug for DaemonHandle {
 ///     }
 /// }
 /// ```
-#[tonic::async_trait]
-pub trait Component: Send + Sync {
+#[enum_dispatch]
+#[allow(async_fn_in_trait, reason = "only used within our code and we don't need it to be Send")]
+pub trait Component: Send + Sync + Into<AnyComponent> {
     /// Human-readable name for logging and debugging.
     fn name(&self) -> &'static str;
 
@@ -237,6 +247,12 @@ pub trait Component: Send + Sync {
     async fn stop(&mut self) -> Result<()>;
 }
 
+/// Static-dispatch enum over the daemon components.
+#[enum_dispatch(Component)]
+pub enum AnyComponent {
+    Search(SearchComponent),
+}
+
 // ============================================================================
 // Daemon
 // ============================================================================
@@ -258,19 +274,21 @@ pub trait Component: Send + Sync {
 /// Events emitted during handling are queued and processed in subsequent
 /// iterations, ensuring the loop eventually drains.
 pub struct Daemon {
-    components: Vec<Box<dyn Component>>,
+    components: Vec<AnyComponent>,
     handle: DaemonHandle,
 }
 
 impl Daemon {
     /// Create a new daemon builder.
-    pub fn builder(settings: Settings) -> DaemonBuilder {
+    #[must_use]
+    pub fn builder(settings: Arc<Settings>) -> DaemonBuilder {
         DaemonBuilder::new(settings)
     }
 
     /// Get a clone of the daemon handle.
     ///
     /// The handle can be used to emit events, access settings, etc.
+    #[must_use]
     pub fn handle(&self) -> DaemonHandle {
         self.handle.clone()
     }
@@ -307,10 +325,7 @@ impl Daemon {
                     self.dispatch_event(&event).await;
                 }
                 Err(broadcast::error::RecvError::Lagged(n)) => {
-                    tracing::warn!(
-                        skipped = n,
-                        "event receiver lagged, some events were dropped"
-                    );
+                    tracing::warn!(skipped = n, "event receiver lagged, some events were dropped");
                 }
                 Err(broadcast::error::RecvError::Closed) => {
                     tracing::info!("event bus closed, stopping daemon");
@@ -375,24 +390,23 @@ impl Daemon {
 /// let daemon = Daemon::builder(settings)
 ///     .store(store)
 ///     .history_db(history_db)
-///     .component(HistoryComponent::new())
 ///     .component(SearchComponent::new())
-///     .component(SyncComponent::new())
 ///     .build()
 ///     .await?;
 ///
 /// daemon.run().await?;
 /// ```
 pub struct DaemonBuilder {
-    settings: Settings,
+    settings: Arc<Settings>,
     store: Option<SqliteStore>,
     history_db: Option<HistoryDatabase>,
-    components: Vec<Box<dyn Component>>,
+    components: Vec<AnyComponent>,
 }
 
 impl DaemonBuilder {
     /// Create a new daemon builder with the given settings.
-    pub fn new(settings: Settings) -> Self {
+    #[must_use]
+    pub fn new(settings: Arc<Settings>) -> Self {
         Self {
             settings,
             store: None,
@@ -402,12 +416,14 @@ impl DaemonBuilder {
     }
 
     /// Set the record store.
+    #[must_use]
     pub fn store(mut self, store: SqliteStore) -> Self {
         self.store = Some(store);
         self
     }
 
     /// Set the history database.
+    #[must_use]
     pub fn history_db(mut self, db: HistoryDatabase) -> Self {
         self.history_db = Some(db);
         self
@@ -416,27 +432,30 @@ impl DaemonBuilder {
     /// Register a component.
     ///
     /// Components are started in registration order and stopped in reverse order.
-    pub fn component(mut self, component: impl Component + 'static) -> Self {
-        self.components.push(Box::new(component));
+    #[must_use]
+    pub fn component(mut self, component: impl Component) -> Self {
+        self.components.push(component.into());
         self
     }
 
     /// Build the daemon.
     ///
     /// This loads the encryption key and creates the daemon state.
-    pub async fn build(self) -> Result<Daemon> {
+    pub fn build(self) -> Result<Daemon> {
         let store = self.store.ok_or_else(|| eyre::eyre!("store is required"))?;
-        let history_db = self
-            .history_db
-            .ok_or_else(|| eyre::eyre!("history_db is required"))?;
+        let history_db = self.history_db.ok_or_else(|| eyre::eyre!("history_db is required"))?;
 
         // Load encryption key
-        let encryption_key: [u8; 32] = encryption::load_key(&self.settings)
-            .context("could not load encryption key")?
-            .into();
+        let encryption_key = paseto_v4::Key::try_load_or_generate(&self.settings.key_path)
+            .context("could not load encryption key")?;
 
         // Create the event bus
         let (event_tx, _) = broadcast::channel(64);
+
+        // One capability reader for the whole daemon: shared by the history component's packing
+        // path and injected into every sync tick's client, so the server is only polled by one
+        // warmer.
+        let caps = caps_client(&self.settings).context("failed to build the capability reader")?;
 
         // Create the shared state
         let state = Arc::new(DaemonState {
@@ -445,6 +464,7 @@ impl DaemonBuilder {
             encryption_key,
             history_db,
             store,
+            caps,
         });
 
         // Create the handle (just a reference to the state)

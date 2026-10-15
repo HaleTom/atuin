@@ -4,11 +4,16 @@
 use clap::Parser;
 use clap::builder::Styles;
 use clap::builder::styling::{AnsiColor, Effects};
+use command::AtuinCmd;
 use eyre::Result;
 
-use command::AtuinCmd;
+use crate::i18n::fl;
 
 mod command;
+mod i18n;
+pub(crate) mod logs;
+#[cfg(feature = "client")]
+pub(crate) mod shell;
 
 #[cfg(feature = "sync")]
 mod print_error;
@@ -36,7 +41,6 @@ const STYLES: Styles = Styles::styled()
     .literal(AnsiColor::Green.on_default().effects(Effects::BOLD))
     .placeholder(AnsiColor::Green.on_default());
 
-/// Magical shell history
 #[derive(Parser)]
 #[command(
     author = "Ellie Huxtable <ellie@atuin.sh>",
@@ -44,6 +48,7 @@ const STYLES: Styles = Styles::styled()
     long_version = LONG_VERSION,
     help_template(HELP_TEMPLATE),
     styles = STYLES,
+    about = fl!("cmd-atuin"),
 )]
 struct Atuin {
     #[command(subcommand)]

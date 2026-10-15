@@ -3,27 +3,28 @@
 //! Provides fuzzy search over command history using the Nucleo search library
 //! with frecency-based ranking and dynamic filtering.
 
-use std::{pin::Pin, sync::Arc};
+use std::pin::{Pin, pin};
+use std::sync::Arc;
 
-use atuin_client::database::Database;
+use atuin_common::filter::OrFilter;
+use atuin_common::path::DisplayRichExt;
 use eyre::Result;
+use futures::{StreamExt, TryStreamExt};
 use tokio::sync::RwLock;
 use tokio_stream::Stream;
 use tonic::{Request, Response, Status, Streaming};
-use tracing::{Level, debug, info, instrument, span, trace};
-use uuid::Uuid;
+use tracing::{Level, debug, error, info, instrument, span, trace};
 
-use crate::{
-    daemon::{Component, DaemonHandle},
-    events::DaemonEvent,
-    search::{
-        FilterMode, IndexFilterMode, QueryContext, SearchIndex, SearchRequest, SearchResponse,
-        search_server::{Search as SearchSvc, SearchServer},
-    },
+use crate::daemon::{Component, DaemonHandle};
+use crate::events::DaemonEvent;
+use crate::output_capture::OutputStore;
+use crate::search::search_server::{Search as SearchSvc, SearchServer};
+use crate::search::{
+    FilterMode, IndexFilterMode, OutputSearchLine, OutputSearchMatch, PrepareIndexRequest,
+    PrepareIndexResponse, SearchCommandOutputRequest, SearchIndex, SearchRequest, SearchResponse,
 };
 
-const PAGE_SIZE: usize = 5000;
-const RESULTS_LIMIT: u32 = 200;
+const RESULTS_LIMIT: usize = 200;
 /// How often to rebuild the frecency map (in seconds).
 const FRECENCY_REFRESH_INTERVAL_SECS: u64 = 60;
 
@@ -36,68 +37,71 @@ const FRECENCY_REFRESH_INTERVAL_SECS: u64 = 60;
 /// - Provides the Search gRPC service
 pub struct SearchComponent {
     index: Arc<RwLock<SearchIndex>>,
-    handle: tokio::sync::RwLock<Option<DaemonHandle>>,
+    handle: Option<DaemonHandle>,
     loader_handle: Option<tokio::task::JoinHandle<()>>,
     frecency_handle: Option<tokio::task::JoinHandle<()>>,
 }
 
 impl SearchComponent {
     /// Create a new search component.
+    #[must_use]
     pub fn new() -> Self {
         Self {
-            index: Arc::new(RwLock::new(SearchIndex::new())),
-            handle: tokio::sync::RwLock::new(None),
+            index: Arc::new(RwLock::new(SearchIndex::default())),
+            handle: None,
             loader_handle: None,
             frecency_handle: None,
         }
     }
 
     /// Get the gRPC service for this component.
-    pub fn grpc_service(&self) -> SearchServer<SearchGrpcService> {
-        SearchServer::new(SearchGrpcService {
+    #[must_use]
+    pub fn grpc_service(&self, output_store: Arc<OutputStore>) -> SearchGrpcServiceBuilder {
+        SearchGrpcServiceBuilder {
             index: self.index.clone(),
-        })
+            output_store,
+        }
     }
 
-    /// Rebuild the entire search index from the database.
-    async fn rebuild_index(&self) -> Result<()> {
-        let handle_guard = self.handle.read().await;
-        let handle = handle_guard
-            .as_ref()
-            .ok_or_else(|| eyre::eyre!("component not initialized"))?;
+    /// Get a shared handle to the live search index.
+    #[must_use]
+    pub fn index(&self) -> Arc<RwLock<SearchIndex>> {
+        self.index.clone()
+    }
 
-        info!("Rebuilding search index from database");
+    #[instrument(skip_all, level = Level::TRACE)]
+    async fn rebuild_frecency(handle: &DaemonHandle, index: &RwLock<SearchIndex>) {
+        let settings = handle.settings().await;
+        index.read().await.rebuild_frecency(&settings.search);
+    }
 
-        // Create a new index
-        let new_index = SearchIndex::new();
-
-        // Load all history into the new index
-        let db = handle.history_db().clone();
-        let mut pager = db.all_paged(PAGE_SIZE, false, true);
-        loop {
-            match pager.next().await {
-                Ok(Some(histories)) => {
-                    info!(
-                        "Loading {} history entries into search index",
-                        histories.len()
-                    );
-                    new_index.add_histories(&histories);
-                }
-                Ok(None) => break,
-                Err(e) => {
-                    tracing::error!("Failed to load history during rebuild: {}", e);
-                    break;
-                }
-            }
+    /// Rebuild the search index from the database, then its frecency map.
+    ///
+    /// The read guard is re-acquired per page rather than held across the whole load, so concurrent
+    /// index operations aren't blocked while this does its expensive work.
+    #[instrument(skip_all, level = Level::TRACE)]
+    async fn rebuild_index(
+        handle: &DaemonHandle,
+        index: &RwLock<SearchIndex>,
+    ) -> Result<(), eyre::Error> {
+        info!(
+            "Loading history into search index; page size = {}",
+            SearchIndex::HISTORY_LOAD_PAGE_SIZE
+        );
+        let mut pages = pin!(SearchIndex::history_pages(handle.history_db()));
+        while let Some(histories) =
+            pages.try_next().await.inspect_err(|e| error!("Failed to load history: {e}"))?
+        {
+            info!("Loading {} history entries into search index", histories.len());
+            index.read().await.add_histories(&histories);
         }
 
         info!(
-            "Search index rebuild complete; {} unique commands",
-            new_index.command_count()
+            "History load complete; {} unique commands indexed",
+            index.read().await.command_count()
         );
 
-        // Replace the old index with the new one
-        *self.index.write().await = new_index;
+        Self::rebuild_frecency(handle, index).await;
         Ok(())
     }
 }
@@ -108,57 +112,37 @@ impl Default for SearchComponent {
     }
 }
 
-#[tonic::async_trait]
 impl Component for SearchComponent {
     fn name(&self) -> &'static str {
         "search"
     }
 
     async fn start(&mut self, handle: DaemonHandle) -> Result<()> {
-        *self.handle.write().await = Some(handle.clone());
+        self.handle = Some(handle.clone());
 
+        // TODO(#4052): This is inherently racy -- any add_history operations added between this
+        //              .read() and the subsequent .write() are completely discarded from the new
+        //              index.
         // Spawn background task to load history into index
         let index = self.index.clone();
-        let db = handle.history_db().clone();
         let handle_for_loader = handle.clone();
 
         self.loader_handle = Some(tokio::spawn(async move {
-            info!(
-                "Loading history into search index; page size = {}",
-                PAGE_SIZE
-            );
-            let mut pager = db.all_paged(PAGE_SIZE, false, true);
-            loop {
-                match pager.next().await {
-                    Ok(Some(histories)) => {
-                        info!(
-                            "Loading {} history entries into search index",
-                            histories.len()
-                        );
-                        index.read().await.add_histories(&histories);
-                    }
-                    Ok(None) => {
-                        info!(
-                            "Initial history load complete; {} unique commands indexed",
-                            index.read().await.command_count()
-                        );
-                        // Build initial frecency map with current settings
-                        let settings = handle_for_loader.settings().await;
-                        index.read().await.rebuild_frecency(&settings.search).await;
-                        info!("Initial frecency map built");
-                        break;
-                    }
-                    Err(e) => {
-                        tracing::error!("Failed to load history: {}", e);
-                        break;
-                    }
-                }
-            }
+            // Build the initial shell filter from the settings. If `search.shells` is "auto", this
+            // will use the value of the `ATUIN_SHELL` environment variable. This variable might be
+            // correct if the daemon was autostarted by the shell hooks, but if it's unset or
+            // incorrect, we'll simply rebuild the index upon receipt of the first request.
+            let shells =
+                handle_for_loader.settings().await.search.shells.to_filter().to_vec_filter();
+            index.write().await.shells = shells;
+            let _ = Self::rebuild_index(&handle_for_loader, &index).await.inspect_err(|err| {
+                error!(?err, "failed to rebuild the index.");
+            });
         }));
 
         // Spawn background task to periodically refresh frecency
+        let handle_for_frecency = handle;
         let index_for_frecency = self.index.clone();
-        let handle_for_frecency = handle.clone();
         self.frecency_handle = Some(tokio::spawn(async move {
             let mut interval = tokio::time::interval(std::time::Duration::from_secs(
                 FRECENCY_REFRESH_INTERVAL_SECS,
@@ -166,12 +150,7 @@ impl Component for SearchComponent {
             loop {
                 interval.tick().await;
                 trace!("Refreshing frecency map");
-                let settings = handle_for_frecency.settings().await;
-                index_for_frecency
-                    .read()
-                    .await
-                    .rebuild_frecency(&settings.search)
-                    .await;
+                Self::rebuild_frecency(&handle_for_frecency, &index_for_frecency).await;
             }
         }));
 
@@ -181,81 +160,14 @@ impl Component for SearchComponent {
 
     async fn handle_event(&mut self, event: &DaemonEvent) -> Result<()> {
         match event {
-            DaemonEvent::RecordsAdded(records) => {
-                debug!(
-                    count = records.len(),
-                    "Processing added records for search index"
-                );
-
-                let handle_guard = self.handle.read().await;
-                if let Some(handle) = handle_guard.as_ref() {
-                    let histories: Vec<_> = handle
-                        .history_db()
-                        .query_history(
-                            format!(
-                                "select * from history where id in ({})",
-                                records
-                                    .iter()
-                                    .map(|record| record.0.to_string())
-                                    .collect::<Vec<_>>()
-                                    .join(",")
-                            )
-                            .as_str(),
-                        )
-                        .await
-                        .unwrap_or_default();
-
-                    span!(Level::TRACE, "inject_records", count = histories.len())
-                        .in_scope(async || {
-                            self.index.read().await.add_histories(&histories);
-                        })
-                        .await;
-                }
-            }
-            DaemonEvent::HistoryStarted(history) => {
-                debug!(id = %history.id, command = %history.command, "History started (no index action)");
-            }
-            DaemonEvent::HistoryEnded(history) => {
-                span!(Level::TRACE, "inject_history_ended")
-                    .in_scope(async || {
-                        self.index.read().await.add_history(history);
-                    })
-                    .await;
-            }
-            DaemonEvent::HistoryPruned | DaemonEvent::HistoryRebuilt => {
-                info!("History store pruned or rebuilt, rebuilding search index");
-                if let Err(e) = self.rebuild_index().await {
-                    tracing::error!("Failed to rebuild search index: {}", e);
-                }
-            }
-            DaemonEvent::HistoryDeleted { ids } => {
-                info!(
-                    count = ids.len(),
-                    "History deleted, rebuilding search index"
-                );
-                // For now, just rebuild the entire index. A more efficient implementation
-                // would remove specific items from the index.
-                if let Err(e) = self.rebuild_index().await {
-                    tracing::error!("Failed to rebuild search index: {}", e);
-                }
-            }
             DaemonEvent::SettingsReloaded => {
-                info!("Settings reloaded, rebuilding frecency map with new multipliers");
-                let handle_guard = self.handle.read().await;
-                if let Some(handle) = handle_guard.as_ref() {
-                    let settings = handle.settings().await;
-                    self.index
-                        .read()
-                        .await
-                        .rebuild_frecency(&settings.search)
-                        .await;
+                if let Some(handle) = self.handle.as_ref() {
+                    info!("Rebuilding frecency map after settings update");
+                    Self::rebuild_frecency(handle, &self.index).await;
                 }
             }
             // Events we don't care about
-            DaemonEvent::SyncCompleted { .. }
-            | DaemonEvent::SyncFailed { .. }
-            | DaemonEvent::ForceSync
-            | DaemonEvent::ShutdownRequested => {}
+            DaemonEvent::ShutdownRequested => {}
         }
         Ok(())
     }
@@ -272,14 +184,56 @@ impl Component for SearchComponent {
     }
 }
 
+pub struct SearchGrpcServiceBuilder {
+    index: Arc<RwLock<SearchIndex>>,
+    output_store: Arc<OutputStore>,
+}
+
+impl SearchGrpcServiceBuilder {
+    #[must_use]
+    pub fn build(self, handle: DaemonHandle) -> SearchServer<SearchGrpcService> {
+        SearchServer::new(SearchGrpcService {
+            index: self.index,
+            output_store: self.output_store,
+            handle,
+        })
+    }
+}
+
 /// The gRPC service implementation.
+#[derive(Clone)]
 pub struct SearchGrpcService {
     index: Arc<RwLock<SearchIndex>>,
+    output_store: Arc<OutputStore>,
+    handle: DaemonHandle,
+}
+
+impl SearchGrpcService {
+    async fn maybe_rebuild_index(
+        &self,
+        shells: OrFilter<Vec<String>>,
+    ) -> Result<Option<SearchIndex>, ()> {
+        if self.index.read().await.shells == shells {
+            return Ok(None);
+        }
+
+        info!("Rebuilding search index from database after shell filter change");
+
+        let search = self.handle.settings().await.search.clone();
+        let new_index = SearchIndex::from_db(shells, self.handle.history_db(), &search)
+            .await
+            .map_err(|e| error!("Failed to rebuild search index: {e}"))?;
+
+        info!("Search index rebuild complete; {} unique commands", new_index.command_count());
+        Ok(Some(new_index))
+    }
 }
 
 #[tonic::async_trait]
 impl SearchSvc for SearchGrpcService {
     type SearchStream = Pin<Box<dyn Stream<Item = Result<SearchResponse, Status>> + Send>>;
+    type SearchCommandOutputStream =
+        Pin<Box<dyn Stream<Item = Result<OutputSearchMatch, Status>> + Send>>;
 
     #[instrument(skip_all, level = Level::TRACE, name = "search_rpc")]
     async fn search(
@@ -287,7 +241,7 @@ impl SearchSvc for SearchGrpcService {
         request: Request<Streaming<SearchRequest>>,
     ) -> Result<Response<Self::SearchStream>, Status> {
         let mut in_stream = request.into_inner();
-        let index = self.index.clone();
+        let this = self.clone();
 
         // Create output channel
         let (tx, rx) = tokio::sync::mpsc::channel::<Result<SearchResponse, Status>>(128);
@@ -295,66 +249,68 @@ impl SearchSvc for SearchGrpcService {
         // Spawn task to handle incoming requests and send responses
         tokio::spawn(async move {
             while let Some(req) = in_stream.message().await.transpose() {
-                match req {
-                    Ok(search_req) => {
-                        let query = search_req.query;
-                        let query_id = search_req.query_id;
-                        let filter_mode: FilterMode = search_req
-                            .filter_mode
-                            .try_into()
-                            .unwrap_or(FilterMode::Global);
-                        let proto_context = search_req.context;
-
-                        debug!(
-                            "search request: query = {}, query_id = {}, filter_mode = {}, context = {:?}",
-                            query,
-                            query_id,
-                            filter_mode.as_str_name(),
-                            proto_context
-                        );
-
-                        // Convert proto FilterMode + context to IndexFilterMode
-                        let index_filter = convert_filter_mode(filter_mode, &proto_context);
-
-                        // Build QueryContext from proto context
-                        let query_context = proto_context
-                            .map(|ctx| QueryContext {
-                                cwd: Some(with_trailing_slash(&ctx.cwd)),
-                                git_root: ctx.git_root.map(|s| with_trailing_slash(&s)),
-                                hostname: Some(ctx.hostname),
-                                session_id: Some(ctx.session_id),
-                            })
-                            .unwrap_or_default();
-
-                        // Perform the search
-                        let history_ids =
-                            span!(Level::TRACE, "daemon_search_query", %query, query_id)
-                                .in_scope(|| async {
-                                    let index = index.read().await;
-                                    index
-                                        .search(&query, index_filter, &query_context, RESULTS_LIMIT)
-                                        .await
-                                })
-                                .await;
-
-                        // Convert history IDs to bytes
-                        let ids: Vec<Vec<u8>> = history_ids
-                            .iter()
-                            .filter_map(|id| {
-                                Uuid::parse_str(id)
-                                    .ok()
-                                    .map(|uuid| uuid.as_bytes().to_vec())
-                            })
-                            .collect();
-
-                        if tx.send(Ok(SearchResponse { query_id, ids })).await.is_err() {
-                            break; // Client disconnected
-                        }
-                    }
+                let search_req = match req {
+                    Ok(req) => req,
                     Err(e) => {
                         let _ = tx.send(Err(e)).await;
                         break;
                     }
+                };
+
+                let query = search_req.query;
+                let query_id = search_req.query_id;
+                let filter_mode: FilterMode =
+                    search_req.filter_mode.try_into().unwrap_or(FilterMode::Global);
+                let proto_context = search_req.context;
+
+                debug!(
+                    "search request: query = {}, query_id = {}, filter_mode = {}, context = {:?}",
+                    query,
+                    query_id,
+                    filter_mode.as_str_name(),
+                    proto_context
+                );
+
+                // Convert proto FilterMode + context to IndexFilterMode
+                let index_filter = convert_filter_mode(filter_mode, proto_context.as_ref());
+
+                // An empty list in `SearchRequest::shells` means "all".
+                let shells = OrFilter::from_list(search_req.shells).unwrap_or_default();
+                // TODO(#4052): This is inherently racy -- any add_history operations added between
+                //              this .maybe_rebuild_index() and the subsequent .write() are
+                //              completely discarded from the new index.
+                let index = match this.maybe_rebuild_index(shells).await {
+                    Ok(Some(new_index)) => {
+                        let mut guard = this.index.write().await;
+                        *guard = new_index;
+                        guard.downgrade()
+                    }
+                    Ok(None) => this.index.read().await,
+                    Err(()) => {
+                        let _ = tx.send(Err(Status::internal("failed to build index"))).await;
+                        break;
+                    }
+                };
+
+                // Perform the search
+                let history_ids: Vec<Vec<u8>> =
+                    span!(Level::TRACE, "daemon_search_query", %query, query_id).in_scope(|| {
+                        index
+                            .search(&query, &index_filter, RESULTS_LIMIT)
+                            .map(|id| id.into_bytes().to_vec())
+                            .collect()
+                    });
+                drop(index);
+
+                if tx
+                    .send(Ok(SearchResponse {
+                        query_id,
+                        ids: history_ids,
+                    }))
+                    .await
+                    .is_err()
+                {
+                    break; // Client disconnected
                 }
             }
         });
@@ -363,24 +319,80 @@ impl SearchSvc for SearchGrpcService {
         let out_stream = tokio_stream::wrappers::ReceiverStream::new(rx);
         Ok(Response::new(Box::pin(out_stream)))
     }
+
+    async fn prepare_index(
+        &self,
+        request: Request<PrepareIndexRequest>,
+    ) -> Result<Response<PrepareIndexResponse>, Status> {
+        // Same as `SearchRequest::shells` -- empty list means "all".
+        // TODO(#4052): This is inherently racy -- any add_history operations added between this
+        //              .maybe_rebuild_index() and the subsequent .write() are completely discarded
+        //              from the new index.
+        let shells = OrFilter::from_list(request.into_inner().shells).unwrap_or_default();
+        if let Some(index) = self
+            .maybe_rebuild_index(shells)
+            .await
+            .map_err(|()| Status::internal("failed to build index"))?
+        {
+            *self.index.write().await = index;
+        }
+        Ok(Response::new(PrepareIndexResponse {}))
+    }
+
+    #[instrument(skip_all, level = Level::TRACE, name = "search_command_output_rpc")]
+    async fn search_command_output(
+        &self,
+        request: Request<SearchCommandOutputRequest>,
+    ) -> Result<Response<Self::SearchCommandOutputStream>, Status> {
+        let request = request.into_inner();
+
+        // 0 means unbounded: the index streams results lazily by relevance, so the client can
+        // consume what it needs and drop the stream. There is no server-side ceiling here.
+        let limit = usize::try_from(request.limit).unwrap_or(0);
+        let context = request.context.map(|c| usize::try_from(c).unwrap_or(usize::MAX));
+
+        let matches =
+            self.output_store.search(&request.query, limit, context).await.items().map(|result| {
+                match result {
+                    Ok(m) => Ok(OutputSearchMatch {
+                        history_id: Some(m.history_id.into()),
+                        lines: m
+                            .lines
+                            .iter()
+                            .map(|l| OutputSearchLine {
+                                line: l.line,
+                                content: Some((&l.content).into()),
+                            })
+                            .collect(),
+                        score: m.score,
+                    }),
+                    Err(err) => {
+                        error!(?err, "output full-text search failed");
+                        Err(Status::internal("output search failed"))
+                    }
+                }
+            });
+
+        Ok(Response::new(Box::pin(matches)))
+    }
 }
 
 /// Convert proto FilterMode and context to IndexFilterMode.
 fn convert_filter_mode(
     mode: FilterMode,
-    context: &Option<crate::search::SearchContext>,
+    context: Option<&crate::search::SearchContext>,
 ) -> IndexFilterMode {
     match (mode, context) {
         (FilterMode::Global, _) => IndexFilterMode::Global,
         (FilterMode::Directory, Some(ctx)) => {
-            IndexFilterMode::Directory(with_trailing_slash(&ctx.cwd))
+            IndexFilterMode::Directory(ctx.cwd.display_rich().trailing_slash(true).to_string())
         }
         (FilterMode::Workspace, Some(ctx)) => {
             if let Some(ref git_root) = ctx.git_root {
-                IndexFilterMode::Workspace(with_trailing_slash(git_root))
+                IndexFilterMode::Workspace(git_root.display_rich().trailing_slash(true).to_string())
             } else {
                 // Fall back to directory if no git root
-                IndexFilterMode::Directory(with_trailing_slash(&ctx.cwd))
+                IndexFilterMode::Directory(ctx.cwd.display_rich().trailing_slash(true).to_string())
             }
         }
         (FilterMode::Host, Some(ctx)) => IndexFilterMode::Host(ctx.hostname.clone()),
@@ -391,23 +403,5 @@ fn convert_filter_mode(
         }
         // If no context provided, fall back to global
         _ => IndexFilterMode::Global,
-    }
-}
-
-#[cfg(windows)]
-pub fn with_trailing_slash(s: &str) -> String {
-    if s.ends_with('\\') {
-        s.to_string()
-    } else {
-        format!("{}\\", s)
-    }
-}
-
-#[cfg(not(windows))]
-pub fn with_trailing_slash(s: &str) -> String {
-    if s.ends_with('/') {
-        s.to_string()
-    } else {
-        format!("{}/", s)
     }
 }

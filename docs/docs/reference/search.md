@@ -1,17 +1,18 @@
 # search
 
 Atuin search supports wildcards, with either the `*` or `%` character. By
-default, a prefix search is performed (ie, all queries are automatically
+default, a prefix search is performed (that is, all queries are automatically
 appended with a wildcard).
 
-| Arg &nbsp; &nbsp; &nbsp; &nbsp; &nbsp; &nbsp; &nbsp; &nbsp; &nbsp; &nbsp; &nbsp; &nbsp;| Description |
+| Arg                  | Description |
 | -------------------- | ----------------------------------------------------------------------------- |
 | `--cwd`/`-c`         | The directory to list history for (default: all dirs)                         |
-| `--exclude-cwd`      | Do not include commands that ran in this directory (default: none)            |
-| `--exit`/`-e`        | Filter by exit code (default: none)                                           |
-| `--exclude-exit`     | Do not include commands that exited with this value (default: none)           |
-| `--before`           | Only include commands ran before this time(default: none)                     |
-| `--after`            | Only include commands ran after this time(default: none)                      |
+| `--exclude-cwd`      | Don't include commands that ran in this directory (default: none)             |
+| `--exit`/`-e`        | Filter by exit code; repeat to include any listed code (default: none)        |
+| `--exclude-exit`     | Exclude an exit code; repeat to exclude all listed codes (default: none)      |
+| `--before`           | Only include commands run before this time (default: none)                    |
+| `--after`            | Only include commands run after this time (default: none)                     |
+| `--timezone`/`--tz`  | Timezone to display times in and to read `--before`/`--after` in (default: configured `timezone`) |
 | `--interactive`/`-i` | Open the interactive search UI (default: false)                               |
 | `--human`            | Use human-readable formatting for the timestamp and duration (default: false) |
 | `--limit`            | Limit the number of results (default: none)                                   |
@@ -25,17 +26,17 @@ appended with a wildcard).
 
 ## `atuin search -i`
 
-Atuin's interactive search TUI allows you to fuzzy search through your history.
+Use Atuin's interactive search TUI to fuzzy search through your history.
 
 ![compact](https://user-images.githubusercontent.com/1710904/161623659-4fec047f-ea4b-471c-9581-861d2eb701a9.png)
 
 You can replay the `nth` command with `alt + #` where `#` is the line number of the command you would like to replay.
 
-Note: This is not yet supported on macOS.
+Note: This isn't yet supported on macOS.
 
 ## Examples
 
-```
+```shell
 # Open the interactive search TUI
 atuin search -i
 
@@ -44,6 +45,12 @@ atuin search -i atuin
 
 # Search for all commands, beginning with cargo, that exited successfully
 atuin search --exit 0 cargo
+
+# Search for commands with exit code 1 or 2
+atuin search --exit 1 --exit 2
+
+# Exclude commands with exit code 0 or 130
+atuin search --exclude-exit 0 --exclude-exit 130
 
 # Search for all commands, that failed, from the current dir, and were ran before April 1st 2021
 atuin search --exclude-exit 0 --before 01/04/2021 --cwd .
@@ -63,3 +70,5 @@ atuin search --offset 1 --limit 1 cargo
 # Find the oldest cargo command
 atuin search --limit 1 --reverse cargo
 ```
+
+When both flags are used, results must match one of the included codes and none of the excluded codes.

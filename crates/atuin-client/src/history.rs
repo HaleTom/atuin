@@ -1,62 +1,297 @@
-use core::fmt::Formatter;
-use rmp::decode::DecodeStringError;
-use rmp::decode::ValueReadError;
-use rmp::{Marker, decode::Bytes};
-use std::env;
-use std::fmt::Display;
+use std::sync::LazyLock;
 
-use atuin_common::record::DecryptedData;
-use atuin_common::utils::uuid_v7;
-
-use eyre::{Result, bail, eyre};
-
-use crate::secrets::SECRET_PATTERNS_RE;
-use crate::settings::Settings;
-use crate::utils::get_host_user;
+use atuin_common::filter::OrFilter;
+use atuin_common::rmp::decode::{self, Bytes, DecodeError};
+use atuin_common::rmp::encode::{self, ByteBuf, EncodeError};
+use atuin_common::secrets::contains_secret;
+use atuin_common::time::OffsetDateTimeExt;
+use atuin_common::utils::{normalize_optional_string, uuid_v7};
+use atuin_domain::record::{CmdOrigin, DecryptedData, UNKNOWN_USER};
+use easy_cast::Conv;
+use eyre::Result;
+use serde::{Deserialize, Serialize};
+use thiserror;
 use time::OffsetDateTime;
+use uuid::Uuid;
 
-mod builder;
+use crate::settings::Settings;
+
+pub(crate) mod builder;
+pub mod capture;
 pub mod store;
 
-/// Known AI agent author values. Used to expand `$all-agent` and `$all-user` filters.
-pub const KNOWN_AGENTS: &[&str] = &["claude-code", "codex", "copilot", "pi"];
+pub use capture::CommandCapture;
+
+/// Known AI agent author values. Used by [`History::is_agent`] to guess who ran a command when the
+/// entry does not state it, and so when matching against [`AuthorPattern::AllAgent`] and
+/// [`AuthorPattern::AllUser`].
+pub const KNOWN_AGENTS: &[&str] = &["claude-code", "codex", "copilot", "opencode", "pi"];
+
+/// The spelling of [`AuthorPattern::AllUser`] on the command line and in the MCP tool schema.
 pub const AUTHOR_FILTER_ALL_USER: &str = "$all-user";
+
+/// The spelling of [`AuthorPattern::AllAgent`] on the command line and in the MCP tool schema.
 pub const AUTHOR_FILTER_ALL_AGENT: &str = "$all-agent";
 
+#[must_use]
 pub fn is_known_agent(author: &str) -> bool {
     KNOWN_AGENTS.contains(&author)
 }
 
-pub fn author_matches_filters(author: &str, filters: &[String]) -> bool {
-    filters.is_empty()
-        || filters.iter().any(|filter| match filter.as_str() {
-            AUTHOR_FILTER_ALL_USER => !is_known_agent(author),
-            AUTHOR_FILTER_ALL_AGENT => is_known_agent(author),
-            literal => author == literal,
-        })
+/// Who wrote a history entry, as declared by whatever captured it.
+///
+/// This is stored as a small integer, both on the wire and in the database, and is optional: an
+/// entry captured before this field existed, or by an integration that does not set it, has no
+/// kind, and [`History::is_agent`] falls back to inspecting the author name. A stored value we
+/// don't recognise (written by a future version with more kinds) decodes as "not stated" too:
+/// [`Self::from_repr`] returns `None` rather than an error.
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Hash, clap::ValueEnum, strum_macros::FromRepr)]
+#[repr(u8)]
+pub enum AuthorKind {
+    /// A human ran this command.
+    User = 1,
+    /// An AI agent ran this command.
+    Agent = 2,
 }
 
-pub(crate) const HISTORY_VERSION_V0: &str = "v0";
-pub(crate) const HISTORY_VERSION_V1: &str = "v1";
-const HISTORY_RECORD_VERSION_V0: u16 = 0;
-const HISTORY_RECORD_VERSION_V1: u16 = 1;
-pub(crate) const HISTORY_VERSION: &str = HISTORY_VERSION_V1;
-pub const HISTORY_TAG: &str = "history";
-const HISTORY_AUTHOR_ENV: &str = "ATUIN_HISTORY_AUTHOR";
-const HISTORY_INTENT_ENV: &str = "ATUIN_HISTORY_INTENT";
+impl AuthorKind {
+    /// Every recognised kind. The SQL author filter derives its recognised-value list from this,
+    /// so it stays in lockstep with [`Self::from_repr`] (a test pins the two together).
+    pub const VARIANTS: [Self; 2] = [Self::User, Self::Agent];
 
-#[derive(Clone, Debug, Eq, PartialEq, Hash)]
-pub struct HistoryId(pub String);
+    #[must_use]
+    pub const fn as_u8(self) -> u8 {
+        self as u8
+    }
 
-impl Display for HistoryId {
-    fn fmt(&self, f: &mut Formatter<'_>) -> std::fmt::Result {
-        write!(f, "{}", self.0)
+    /// The kind stated by the invoking integration's environment (`ATUIN_HISTORY_AUTHOR_KIND`).
+    #[must_use]
+    pub fn probe_current() -> Option<Self> {
+        let value = atuin_common::env::var(HISTORY_AUTHOR_KIND_ENV).ok()?;
+        clap::ValueEnum::from_str(&value, true).ok()
     }
 }
 
-impl From<String> for HistoryId {
-    fn from(s: String) -> Self {
-        Self(s)
+/// An element of an author filter.
+///
+/// In addition to a plain string, this type can also be the special pattern `AllUser` or
+/// `AllAgent`, which matches agent-run commands or everything that is not one.
+#[derive(Clone, Debug, Eq, Ord, PartialEq, PartialOrd)]
+pub enum AuthorPattern {
+    /// Matches every entry that is not an agent's (see [`History::is_agent`]).
+    AllUser,
+    /// Matches every entry that is an agent's (see [`History::is_agent`]).
+    AllAgent,
+    /// Matches exactly one author name.
+    Name(String),
+}
+
+impl From<String> for AuthorPattern {
+    fn from(value: String) -> Self {
+        match value.as_str() {
+            AUTHOR_FILTER_ALL_USER => Self::AllUser,
+            AUTHOR_FILTER_ALL_AGENT => Self::AllAgent,
+            _ => Self::Name(value),
+        }
+    }
+}
+
+impl From<&str> for AuthorPattern {
+    fn from(value: &str) -> Self {
+        match value {
+            AUTHOR_FILTER_ALL_USER => Self::AllUser,
+            AUTHOR_FILTER_ALL_AGENT => Self::AllAgent,
+            _ => Self::Name(value.to_owned()),
+        }
+    }
+}
+
+/// An author filter that only allows non-agent commands (i.e., [`AuthorPattern::AllUser`]).
+///
+/// This function uses a [`LazyLock`] to avoid building the filter every time.
+pub fn all_user_author_filter() -> OrFilter<&'static [AuthorPattern]> {
+    static FILTER: LazyLock<OrFilter<Vec<AuthorPattern>>> = LazyLock::new(|| {
+        OrFilter::from_list(vec![AuthorPattern::AllUser]).expect("the vector is not empty")
+    });
+    FILTER.as_slice_filter()
+}
+
+const HISTORY_AUTHOR_ENV: &str = "ATUIN_HISTORY_AUTHOR";
+const HISTORY_AUTHOR_KIND_ENV: &str = "ATUIN_HISTORY_AUTHOR_KIND";
+const HISTORY_INTENT_ENV: &str = "ATUIN_HISTORY_INTENT";
+
+/// The author identity exported by the invoking integration (`ATUIN_HISTORY_AUTHOR`).
+#[must_use]
+pub fn probe_author() -> Option<String> {
+    normalize_optional_string(atuin_common::env::var(HISTORY_AUTHOR_ENV).ok())
+}
+
+#[derive(Debug, Clone, Copy, Eq, PartialEq, Ord, PartialOrd, derive_more::Display)]
+#[display("{}", self.name())]
+#[repr(u16)]
+pub enum Version {
+    Zero = 0,
+    One = 1,
+    Two = 2,
+}
+
+impl Version {
+    pub const VARIANTS: [Self; 3] = [Self::Zero, Self::One, Self::Two];
+    pub const LATEST: Self = Self::Two;
+
+    #[must_use]
+    pub fn from_name(s: &str) -> Option<Self> {
+        match s {
+            "v0" => Some(Self::Zero),
+            "v1" => Some(Self::One),
+            "v2" => Some(Self::Two),
+            _ => None,
+        }
+    }
+
+    #[must_use]
+    pub const fn name(&self) -> &'static str {
+        match self {
+            Self::Zero => "v0",
+            Self::One => "v1",
+            Self::Two => "v2",
+        }
+    }
+
+    #[must_use]
+    pub const fn as_int(&self) -> u16 {
+        *self as u16
+    }
+
+    #[must_use]
+    pub fn min_fields(&self) -> u32 {
+        match self {
+            Self::Zero => 9,
+            Self::One => 10,
+            Self::Two => 12,
+        }
+    }
+
+    #[must_use]
+    pub fn max_fields(&self) -> Option<u32> {
+        match self {
+            Self::Zero => Some(9),
+            Self::One => Some(11),
+            Self::Two => None,
+        }
+    }
+}
+
+/// Number of fields [`History::serialize`] writes.
+///
+/// This is deliberately not [`Version::min_fields`]: fields appended to the latest version grow
+/// this count, while `min_fields` stays at the 12 fields V2 launched with so that entries written
+/// before the new fields existed still decode.
+const LATEST_SERIALIZED_FIELDS: u32 = 13;
+
+/// A V2 record contains `author_kind` iff it has at least this many fields.
+///
+/// Frozen forever at the position `author_kind` was appended at; do not grow it alongside
+/// [`LATEST_SERIALIZED_FIELDS`].
+const V2_AUTHOR_KIND_FIELD_NUMBER: u32 = 13;
+
+// Because of how our encoding/decoding protocol worked, unlike all other UUID types in Atuin, which
+// use hyphenated encoding, this one displays as the simple (hyphen-less) representation. This
+// `Display` is the single source of that form — `.to_string()` derives from it.
+//
+// Be very, very careful changing this.
+#[derive(
+    Clone,
+    Copy,
+    Debug,
+    Eq,
+    PartialEq,
+    Ord,
+    PartialOrd,
+    Hash,
+    derive_more::Display,
+    derive_more::From,
+)]
+#[display("{}", _0.as_simple())]
+pub struct HistoryId(uuid::Uuid);
+
+impl std::str::FromStr for HistoryId {
+    type Err = uuid::Error;
+
+    fn from_str(s: &str) -> Result<Self, Self::Err> {
+        Ok(Self(uuid::Uuid::parse_str(s)?))
+    }
+}
+
+impl Serialize for HistoryId {
+    fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
+    where
+        S: serde::Serializer,
+    {
+        serializer.collect_str(self)
+    }
+}
+
+impl<'de> Deserialize<'de> for HistoryId {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: serde::Deserializer<'de>,
+    {
+        let s = <std::borrow::Cow<'de, str>>::deserialize(deserializer)?;
+        s.parse().map_err(serde::de::Error::custom)
+    }
+}
+
+impl sqlx::Type<sqlx::Sqlite> for HistoryId {
+    fn type_info() -> <sqlx::Sqlite as sqlx::Database>::TypeInfo {
+        <String as sqlx::Type<sqlx::Sqlite>>::type_info()
+    }
+
+    fn compatible(ty: &<sqlx::Sqlite as sqlx::Database>::TypeInfo) -> bool {
+        <String as sqlx::Type<sqlx::Sqlite>>::compatible(ty)
+    }
+}
+
+impl sqlx::Encode<'_, sqlx::Sqlite> for HistoryId {
+    fn encode_by_ref(
+        &self,
+        buf: &mut <sqlx::Sqlite as sqlx::Database>::ArgumentBuffer,
+    ) -> Result<sqlx::encode::IsNull, sqlx::error::BoxDynError> {
+        <String as sqlx::Encode<sqlx::Sqlite>>::encode(self.to_string(), buf)
+    }
+}
+
+impl<'r> sqlx::Decode<'r, sqlx::Sqlite> for HistoryId {
+    fn decode(
+        value: <sqlx::Sqlite as sqlx::Database>::ValueRef<'r>,
+    ) -> Result<Self, sqlx::error::BoxDynError> {
+        let s = <&str as sqlx::Decode<sqlx::Sqlite>>::decode(value)?;
+        Ok(s.parse()?)
+    }
+}
+
+impl HistoryId {
+    #[must_use]
+    pub fn new(uuid: Uuid) -> Self {
+        Self(uuid)
+    }
+
+    #[must_use]
+    pub fn into_bytes(self) -> [u8; 16] {
+        self.0.into_bytes()
+    }
+
+    /// Reconstruct a [`HistoryId`] from the raw 16 bytes of its UUID.
+    ///
+    /// This is the inverse of [`HistoryId::into_bytes`].
+    #[must_use]
+    pub fn from_bytes(bytes: [u8; 16]) -> Self {
+        Self(Uuid::from_bytes(bytes))
+    }
+
+    #[must_use]
+    pub fn to_string(&self) -> String {
+        self.0.as_simple().to_string()
     }
 }
 
@@ -73,7 +308,7 @@ impl From<String> for HistoryId {
 //
 // New fields must be added to `History::{serialize,deserialize}` in a backwards
 // compatible way (sensible defaults and careful `nfields` handling).
-#[derive(Debug, Clone, PartialEq, Eq, sqlx::FromRow)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct History {
     /// A client-generated ID, used to identify the entry when syncing.
     ///
@@ -92,53 +327,60 @@ pub struct History {
     /// The session ID, associated with a terminal session.
     pub session: String,
     /// The hostname of the machine the command was run on.
-    pub hostname: String,
+    pub cmd_origin: CmdOrigin,
     /// Who wrote this command (human user or automation/agent identity).
     pub author: String,
     /// Optional rationale for why the command was executed.
     pub intent: Option<String>,
     /// Timestamp, which is set when the entry is deleted, allowing a soft delete.
     pub deleted_at: Option<OffsetDateTime>,
+    /// The shell used to run the command.
+    pub shell: Option<String>,
+    /// Whether a human or an agent wrote this command, if whatever captured it said so.
+    ///
+    /// When this is `None`, [`History::is_agent`] guesses from the author name.
+    pub author_kind: Option<AuthorKind>,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, sqlx::FromRow)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct HistoryStats {
-    /// The command that was ran after this one in the session
-    pub next: Option<History>,
-    ///
-    /// The command that was ran before this one in the session
-    pub previous: Option<History>,
-
     /// How many times has this command been ran?
     pub total: u64,
-
     pub average_duration: u64,
-
     pub exits: Vec<(i64, i64)>,
-
     pub day_of_week: Vec<(String, i64)>,
-
     pub duration_over_time: Vec<(String, i64)>,
 }
 
+#[derive(Debug, thiserror::Error)]
+pub enum HistoryDeserializeError<'a> {
+    #[error("invalid version: {0}")]
+    InvalidVersion(&'a str),
+    #[error("failed to perform rmp decoding: {0}")]
+    DecodeError(DecodeError<'a>),
+    #[error("expected to decode {expected} record, found v{found}")]
+    VersionMismatch {
+        expected: Version,
+        found: u16,
+    },
+    #[error("unexpected number of fields ({fields}) for history version {version}")]
+    WrongFieldCount {
+        fields: u32,
+        version: Version,
+    },
+    #[error("trailing bytes found in encoded history.")]
+    TrailingBytes,
+    #[error("malformed history id")]
+    MalformedHistoryId(#[source] uuid::Error),
+}
+
+impl<'a> From<DecodeError<'a>> for HistoryDeserializeError<'a> {
+    fn from(e: DecodeError<'a>) -> Self {
+        Self::DecodeError(e)
+    }
+}
+
 impl History {
-    pub(crate) fn author_from_hostname(hostname: &str) -> String {
-        hostname
-            .split_once(':')
-            .map_or_else(|| hostname.to_owned(), |(_, user)| user.to_owned())
-    }
-
-    fn normalize_optional_field(field: Option<String>) -> Option<String> {
-        field.and_then(|value| {
-            let trimmed = value.trim();
-            if trimmed.is_empty() {
-                None
-            } else {
-                Some(trimmed.to_owned())
-            }
-        })
-    }
-
     #[allow(clippy::too_many_arguments)]
     fn new(
         timestamp: OffsetDateTime,
@@ -147,232 +389,196 @@ impl History {
         exit: i64,
         duration: i64,
         session: Option<String>,
-        hostname: Option<String>,
+        cmd_origin: Option<CmdOrigin>,
         author: Option<String>,
         intent: Option<String>,
         deleted_at: Option<OffsetDateTime>,
+        shell: Option<String>,
+        author_kind: Option<AuthorKind>,
     ) -> Self {
         let session = session
-            .or_else(|| env::var("ATUIN_SESSION").ok())
+            .or_else(|| atuin_common::env::var("ATUIN_SESSION").ok())
             .unwrap_or_else(|| uuid_v7().as_simple().to_string());
-        let hostname = hostname.unwrap_or_else(get_host_user);
-        let author = Self::normalize_optional_field(author)
-            .or_else(|| Self::normalize_optional_field(env::var(HISTORY_AUTHOR_ENV).ok()))
-            .unwrap_or_else(|| Self::author_from_hostname(hostname.as_str()));
-        let intent = Self::normalize_optional_field(intent)
-            .or_else(|| Self::normalize_optional_field(env::var(HISTORY_INTENT_ENV).ok()));
+        let cmd_origin = cmd_origin.unwrap_or_else(CmdOrigin::probe_current);
+        let author = normalize_optional_string(author)
+            .or_else(|| normalize_optional_string(atuin_common::env::var(HISTORY_AUTHOR_ENV).ok()))
+            .unwrap_or_else(|| cmd_origin.user().to_string());
+        let intent = normalize_optional_string(intent)
+            .or_else(|| normalize_optional_string(atuin_common::env::var(HISTORY_INTENT_ENV).ok()));
+        let shell = normalize_optional_string(shell);
 
         Self {
-            id: uuid_v7().as_simple().to_string().into(),
+            id: HistoryId::from(uuid_v7()),
             timestamp,
             command,
             cwd,
             exit,
             duration,
             session,
-            hostname,
+            cmd_origin,
             author,
             intent,
             deleted_at,
+            shell,
+            author_kind,
         }
     }
 
-    pub fn serialize(&self) -> Result<DecryptedData> {
-        // This is pretty much the same as what we used for the old history, with one difference -
-        // it uses integers for timestamps rather than a string format.
+    /// Whether an AI agent, rather than a human, ran this command.
+    ///
+    /// [`Self::author_kind`] is authoritative when the integration that captured the entry set it.
+    /// Otherwise we guess: a known agent name identifies an agent, unless it is also the username
+    /// recorded in the entry's origin, in which case the author is just the default it fell back
+    /// to and tells us nothing. That exception is what stops a user called `pi` from looking like
+    /// the `pi` agent.
+    #[must_use]
+    pub fn is_agent(&self) -> bool {
+        match self.author_kind {
+            Some(kind) => kind == AuthorKind::Agent,
+            None => {
+                // The username the author would have defaulted to. `CmdOrigin::parse_lenient`
+                // maps a legacy colonless hostname to a placeholder user ("unknown-user"), but
+                // old writers defaulted the author to the whole hostname there — as does the SQL
+                // author filter's user expression — so compare against the host in that case.
+                let user = self.cmd_origin.user();
+                let defaulted = if user.as_ref() == UNKNOWN_USER {
+                    self.cmd_origin.host().into_inner()
+                } else {
+                    user.into_inner()
+                };
+                is_known_agent(&self.author) && self.author != defaulted
+            }
+        }
+    }
 
-        use rmp::encode;
-
-        let mut output = vec![];
+    /// Serializes a history entry in the V2 format.
+    ///
+    /// Differences from V1:
+    ///
+    /// * `intent` is always written; if `None`, nil is written to the output.
+    /// * Added new field `shell`.
+    ///
+    /// V2 is designed to allow new fields to be added without incrementing the version. V1 cannot
+    /// accommodate this because its deserialization routine errors if more than 11 fields are
+    /// provided.
+    pub fn serialize(&self) -> Result<DecryptedData, EncodeError> {
+        let mut output = ByteBuf::new();
 
         // write the version
-        encode::write_u16(&mut output, HISTORY_RECORD_VERSION_V1)?;
-        let include_intent = self.intent.is_some();
-        encode::write_array_len(&mut output, 10 + u32::from(include_intent))?;
+        encode::write_u16(&mut output, Version::LATEST.as_int())?;
+        encode::write_array_len(&mut output, LATEST_SERIALIZED_FIELDS)?;
 
-        encode::write_str(&mut output, &self.id.0)?;
-        encode::write_u64(&mut output, self.timestamp.unix_timestamp_nanos() as u64)?;
+        encode::write_str(&mut output, &self.id.to_string())?;
+        encode::write_u64(&mut output, u64::conv(self.timestamp.unix_timestamp_nanos()))?;
         encode::write_sint(&mut output, self.duration)?;
         encode::write_sint(&mut output, self.exit)?;
         encode::write_str(&mut output, &self.command)?;
         encode::write_str(&mut output, &self.cwd)?;
         encode::write_str(&mut output, &self.session)?;
-        encode::write_str(&mut output, &self.hostname)?;
+        encode::write_str(&mut output, self.cmd_origin.as_str())?;
 
-        match self.deleted_at {
-            Some(d) => encode::write_u64(&mut output, d.unix_timestamp_nanos() as u64)?,
-            None => encode::write_nil(&mut output)?,
-        }
-
+        encode::write_optional(
+            &mut output,
+            self.deleted_at.map(|d| u64::conv(d.unix_timestamp_nanos())),
+            encode::write_u64,
+        )?;
         encode::write_str(&mut output, self.author.as_str())?;
-        if let Some(intent) = &self.intent {
-            encode::write_str(&mut output, intent.as_str())?;
-        }
-
-        Ok(DecryptedData(output))
+        encode::write_optional(&mut output, self.intent.as_deref(), encode::write_str)?;
+        encode::write_optional(&mut output, self.shell.as_deref(), encode::write_str)?;
+        encode::write_optional(
+            &mut output,
+            self.author_kind.map(AuthorKind::as_u8),
+            |output, kind| encode::write_uint8(output, kind).map(|_marker| ()),
+        )?;
+        Ok(DecryptedData(output.into_vec()))
     }
 
-    fn read_optional_string(bytes: &[u8]) -> Result<(Option<String>, &[u8])> {
-        use rmp::decode;
-
-        fn error_report<E: std::fmt::Debug>(err: E) -> eyre::Report {
-            eyre!("{err:?}")
-        }
-
-        match decode::read_str_from_slice(bytes) {
-            Ok((value, bytes)) => Ok((Some(value.to_owned()), bytes)),
-            Err(DecodeStringError::TypeMismatch(Marker::Null)) => {
-                let mut cursor = Bytes::new(bytes);
-                decode::read_nil(&mut cursor).map_err(error_report)?;
-
-                Ok((None, cursor.remaining_slice()))
-            }
-            Err(err) => Err(error_report(err)),
-        }
-    }
-
-    fn deserialize_v0(bytes: &[u8]) -> Result<History> {
-        use rmp::decode;
-
-        fn error_report<E: std::fmt::Debug>(err: E) -> eyre::Report {
-            eyre!("{err:?}")
-        }
+    pub fn deserialize<'a>(
+        bytes: &'a [u8],
+        version: &'a str,
+    ) -> std::result::Result<Self, HistoryDeserializeError<'a>> {
+        let version =
+            Version::from_name(version).ok_or(HistoryDeserializeError::InvalidVersion(version))?;
 
         let mut bytes = Bytes::new(bytes);
 
-        let version = decode::read_u16(&mut bytes).map_err(error_report)?;
-
-        if version != HISTORY_RECORD_VERSION_V0 {
-            bail!("expected decoding v0 record, found v{version}");
+        let real_version = decode::read_u16(&mut bytes)?;
+        if real_version != version.as_int() {
+            return Err(HistoryDeserializeError::VersionMismatch {
+                expected: version,
+                found: real_version,
+            });
         }
 
-        let nfields = decode::read_array_len(&mut bytes).map_err(error_report)?;
-
-        if nfields != 9 {
-            bail!("cannot decrypt history from a different version of Atuin");
+        let nfields = decode::read_array_len(&mut bytes)?;
+        let min_fields = version.min_fields();
+        if nfields < min_fields || version.max_fields().is_some_and(|max| nfields > max) {
+            return Err(HistoryDeserializeError::WrongFieldCount {
+                fields: nfields,
+                version,
+            });
         }
 
-        let bytes = bytes.remaining_slice();
-        let (id, bytes) = decode::read_str_from_slice(bytes).map_err(error_report)?;
+        let id = decode::read_string(&mut bytes)?;
+        let timestamp = decode::read_u64(&mut bytes)?;
+        let duration = decode::read_int(&mut bytes)?;
+        let exit = decode::read_int(&mut bytes)?;
 
-        let mut bytes = Bytes::new(bytes);
-        let timestamp = decode::read_u64(&mut bytes).map_err(error_report)?;
-        let duration = decode::read_int(&mut bytes).map_err(error_report)?;
-        let exit = decode::read_int(&mut bytes).map_err(error_report)?;
+        let command = decode::read_string(&mut bytes)?;
+        let cwd = decode::read_string(&mut bytes)?;
+        let session = decode::read_string(&mut bytes)?;
+        #[allow(deprecated)]
+        let cmd_origin = CmdOrigin::parse_lenient(decode::read_string(&mut bytes)?);
+        let deleted_at = decode::read_optional(&mut bytes, decode::read_u64)?;
 
-        let bytes = bytes.remaining_slice();
-        let (command, bytes) = decode::read_str_from_slice(bytes).map_err(error_report)?;
-        let (cwd, bytes) = decode::read_str_from_slice(bytes).map_err(error_report)?;
-        let (session, bytes) = decode::read_str_from_slice(bytes).map_err(error_report)?;
-        let (hostname, bytes) = decode::read_str_from_slice(bytes).map_err(error_report)?;
-
-        let mut bytes = Bytes::new(bytes);
-
-        let (deleted_at, bytes) = match decode::read_u64(&mut bytes) {
-            Ok(unix) => (Some(unix), bytes.remaining_slice()),
-            // we accept null here
-            Err(ValueReadError::TypeMismatch(Marker::Null)) => (None, bytes.remaining_slice()),
-            Err(err) => return Err(error_report(err)),
-        };
-        if !bytes.is_empty() {
-            bail!("trailing bytes in encoded history. malformed")
-        }
-
-        Ok(History {
-            id: id.to_owned().into(),
-            timestamp: OffsetDateTime::from_unix_timestamp_nanos(timestamp as i128)?,
-            duration,
-            exit,
-            command: command.to_owned(),
-            cwd: cwd.to_owned(),
-            session: session.to_owned(),
-            hostname: hostname.to_owned(),
-            author: Self::author_from_hostname(hostname),
-            intent: None,
-            deleted_at: deleted_at
-                .map(|t| OffsetDateTime::from_unix_timestamp_nanos(t as i128))
-                .transpose()?,
-        })
-    }
-
-    fn deserialize_v1(bytes: &[u8]) -> Result<History> {
-        use rmp::decode;
-
-        fn error_report<E: std::fmt::Debug>(err: E) -> eyre::Report {
-            eyre!("{err:?}")
-        }
-
-        let mut bytes = Bytes::new(bytes);
-
-        let version = decode::read_u16(&mut bytes).map_err(error_report)?;
-
-        if version != HISTORY_RECORD_VERSION_V1 {
-            bail!("expected decoding v1 record, found v{version}");
-        }
-
-        let nfields = decode::read_array_len(&mut bytes).map_err(error_report)?;
-
-        if !(10..=11).contains(&nfields) {
-            bail!("cannot decrypt history from a different version of Atuin");
-        }
-
-        let bytes = bytes.remaining_slice();
-        let (id, bytes) = decode::read_str_from_slice(bytes).map_err(error_report)?;
-
-        let mut bytes = Bytes::new(bytes);
-        let timestamp = decode::read_u64(&mut bytes).map_err(error_report)?;
-        let duration = decode::read_int(&mut bytes).map_err(error_report)?;
-        let exit = decode::read_int(&mut bytes).map_err(error_report)?;
-
-        let bytes = bytes.remaining_slice();
-        let (command, bytes) = decode::read_str_from_slice(bytes).map_err(error_report)?;
-        let (cwd, bytes) = decode::read_str_from_slice(bytes).map_err(error_report)?;
-        let (session, bytes) = decode::read_str_from_slice(bytes).map_err(error_report)?;
-        let (hostname, bytes) = decode::read_str_from_slice(bytes).map_err(error_report)?;
-
-        let mut bytes = Bytes::new(bytes);
-
-        let (deleted_at, bytes) = match decode::read_u64(&mut bytes) {
-            Ok(unix) => (Some(unix), bytes.remaining_slice()),
-            // we accept null here
-            Err(ValueReadError::TypeMismatch(Marker::Null)) => (None, bytes.remaining_slice()),
-            Err(err) => return Err(error_report(err)),
-        };
-        let (author, bytes) = Self::read_optional_string(bytes)?;
-        let (intent, bytes) = if nfields > 10 {
-            Self::read_optional_string(bytes)?
+        let author = if version >= Version::One {
+            decode::read_optional(&mut bytes, decode::read_string)?
         } else {
-            (None, bytes)
+            None
         };
 
-        if !bytes.is_empty() {
-            bail!("trailing bytes in encoded history. malformed")
+        let intent = if match version {
+            Version::Zero => false,
+            Version::One => nfields > min_fields,
+            Version::Two => true,
+        } {
+            decode::read_optional(&mut bytes, decode::read_string)?
+        } else {
+            None
+        };
+
+        let shell = if version >= Version::Two {
+            decode::read_optional(&mut bytes, decode::read_string)?
+        } else {
+            None
+        };
+
+        let author_kind = if version >= Version::Two && nfields >= V2_AUTHOR_KIND_FIELD_NUMBER {
+            decode::read_optional(&mut bytes, decode::read_int::<u8, _>)?
+                .and_then(AuthorKind::from_repr)
+        } else {
+            None
+        };
+
+        if version < Version::Two && !bytes.remaining_slice().is_empty() {
+            return Err(HistoryDeserializeError::TrailingBytes);
         }
 
-        Ok(History {
-            id: id.to_owned().into(),
-            timestamp: OffsetDateTime::from_unix_timestamp_nanos(timestamp as i128)?,
+        Ok(Self {
+            id: id.parse().map_err(HistoryDeserializeError::MalformedHistoryId)?,
+            timestamp: OffsetDateTime::from_unix_nanos_u64(timestamp),
             duration,
             exit,
-            command: command.to_owned(),
-            cwd: cwd.to_owned(),
-            session: session.to_owned(),
-            hostname: hostname.to_owned(),
-            author: author.unwrap_or_else(|| Self::author_from_hostname(hostname)),
+            command,
+            cwd,
+            session,
+            author: author.unwrap_or_else(|| cmd_origin.user().to_string()),
+            cmd_origin,
             intent,
-            deleted_at: deleted_at
-                .map(|t| OffsetDateTime::from_unix_timestamp_nanos(t as i128))
-                .transpose()?,
+            deleted_at: deleted_at.map(OffsetDateTime::from_unix_nanos_u64),
+            shell,
+            author_kind,
         })
-    }
-
-    pub fn deserialize(bytes: &[u8], version: &str) -> Result<History> {
-        match version {
-            HISTORY_VERSION_V0 => Self::deserialize_v0(bytes),
-            HISTORY_VERSION_V1 => Self::deserialize_v1(bytes),
-
-            _ => bail!("unknown version {version:?}"),
-        }
     }
 
     /// Builder for a history entry that is imported from shell history.
@@ -473,7 +679,7 @@ impl History {
     ///     .command("ls -la")
     ///     .cwd("/home/user")
     ///     .session("018deb6e8287781f9973ef40e0fde76b")
-    ///     .hostname("computer:ellie")
+    ///     .cmd_origin(atuin_domain::record::CmdOrigin::try_from("computer:ellie").unwrap())
     ///     .build()
     ///     .into();
     /// ```
@@ -515,6 +721,7 @@ impl History {
     ///     .author("user".to_string())
     ///     .intent(None)
     ///     .deleted_at(None)
+    ///     .shell(None)
     ///     .build()
     ///     .into();
     /// ```
@@ -522,104 +729,193 @@ impl History {
         builder::HistoryFromDb::builder()
     }
 
+    #[must_use]
     pub fn success(&self) -> bool {
         self.exit == 0 || self.duration == -1
     }
 
+    #[must_use]
     pub fn should_save(&self, settings: &Settings) -> bool {
         !(self.command.starts_with(' ')
             || self.command.is_empty()
             || settings.history_filter.is_match(&self.command)
             || settings.cwd_filter.is_match(&self.cwd)
-            || (settings.secrets_filter && SECRET_PATTERNS_RE.is_match(&self.command)))
+            || (settings.secrets_filter && contains_secret(&self.command)))
     }
 }
 
 #[cfg(test)]
 mod tests {
+    use atuin_common::filter::OrFilter;
+    use atuin_domain::record::CmdOrigin;
     use regex::RegexSet;
+    use rstest::*;
     use time::macros::datetime;
 
-    use crate::{
-        history::{AUTHOR_FILTER_ALL_AGENT, AUTHOR_FILTER_ALL_USER, HISTORY_VERSION},
-        settings::Settings,
-    };
+    use super::{AuthorKind, AuthorPattern, History, all_user_author_filter, is_known_agent};
+    use crate::history::Version;
+    use crate::settings::Settings;
 
-    use super::{History, author_matches_filters, is_known_agent};
+    /// Whether an author filter permits `history`, mirroring the SQL that
+    /// [`apply_author_filter`](crate::database::OptFilters::authors) builds.
+    ///
+    /// There are only three ways a filter can admit an author, so each is one binary search rather
+    /// than a scan that reinterprets every element in turn. No guard against an author *named*
+    /// `$all-agent` is needed: such an author is an [`AuthorPattern::Name`], a different value from
+    /// [`AuthorPattern::AllAgent`].
+    fn author_matches_filters(history: &History, filters: OrFilter<&[AuthorPattern]>) -> bool {
+        // `contains` is true for an "all" filter, so that case needs no separate check.
+        filters.contains(&AuthorPattern::Name(history.author.clone()))
+            || (filters.contains(&AuthorPattern::AllUser) && !history.is_agent())
+            || (filters.contains(&AuthorPattern::AllAgent) && history.is_agent())
+    }
 
-    // Test that we don't save history where necessary
-    #[test]
-    fn privacy_test() {
-        let settings = Settings {
+    fn entry(author: &str, origin: &str, author_kind: Option<AuthorKind>) -> History {
+        #[allow(deprecated, reason = "the bare-hostname test case has no `:` separator")]
+        History::import()
+            .timestamp(time::OffsetDateTime::now_utc())
+            .command("git status")
+            .cmd_origin(CmdOrigin::parse_lenient(origin))
+            .author(author)
+            .author_kind(author_kind)
+            .build()
+            .into()
+    }
+
+    #[fixture]
+    fn privacy_settings() -> Settings {
+        Settings {
             cwd_filter: RegexSet::new(["^/supasecret"]).unwrap(),
             history_filter: RegexSet::new(["^psql"]).unwrap(),
             ..Settings::utc()
-        };
-
-        let normal_command: History = History::capture()
-            .timestamp(time::OffsetDateTime::now_utc())
-            .command("echo foo")
-            .cwd("/")
-            .build()
-            .into();
-
-        let with_space: History = History::capture()
-            .timestamp(time::OffsetDateTime::now_utc())
-            .command(" echo bar")
-            .cwd("/")
-            .build()
-            .into();
-
-        let empty: History = History::capture()
-            .timestamp(time::OffsetDateTime::now_utc())
-            .command("")
-            .cwd("/")
-            .build()
-            .into();
-
-        let stripe_key: History = History::capture()
-            .timestamp(time::OffsetDateTime::now_utc())
-            .command("curl foo.com/bar?key=sk_test_1234567890abcdefghijklmnop")
-            .cwd("/")
-            .build()
-            .into();
-
-        let secret_dir: History = History::capture()
-            .timestamp(time::OffsetDateTime::now_utc())
-            .command("echo ohno")
-            .cwd("/supasecret")
-            .build()
-            .into();
-
-        let with_psql: History = History::capture()
-            .timestamp(time::OffsetDateTime::now_utc())
-            .command("psql")
-            .cwd("/supasecret")
-            .build()
-            .into();
-
-        assert!(normal_command.should_save(&settings));
-        assert!(!with_space.should_save(&settings));
-        assert!(!empty.should_save(&settings));
-        assert!(!stripe_key.should_save(&settings));
-        assert!(!secret_dir.should_save(&settings));
-        assert!(!with_psql.should_save(&settings));
+        }
     }
 
-    #[test]
+    // Test that we don't save history where necessary
+    #[rstest]
+    #[case::normal("echo foo", "/", true)]
+    #[case::leading_space(" echo bar", "/", false)]
+    #[case::empty("", "/", false)]
+    #[case::stripe_key("curl foo.com/bar?key=sk_test_1234567890abcdefghijklmnop", "/", false)]
+    #[case::secret_dir("echo ohno", "/supasecret", false)]
+    #[case::psql("psql", "/supasecret", false)]
+    fn should_save_respects_privacy(
+        #[from(privacy_settings)] settings: Settings,
+        #[case] command: &str,
+        #[case] cwd: &str,
+        #[case] expected: bool,
+    ) {
+        let history: History = History::capture()
+            .timestamp(time::OffsetDateTime::now_utc())
+            .command(command)
+            .cwd(cwd)
+            .build()
+            .into();
+        assert_eq!(history.should_save(&settings), expected);
+    }
+
+    /// The SQL author filter derives its recognised-kind list from [`AuthorKind::VARIANTS`] while
+    /// Rust decoding goes through [`AuthorKind::from_repr`]; a value present in one but not the
+    /// other would split the two classifiers, so pin them to agree over the whole u8 range.
+    #[rstest]
+    fn author_kind_variants_and_from_repr_agree() {
+        for value in 0..=u8::MAX {
+            assert_eq!(
+                AuthorKind::from_repr(value),
+                AuthorKind::VARIANTS.iter().copied().find(|kind| kind.as_u8() == value),
+                "{value}"
+            );
+        }
+    }
+
+    /// The capture path treats an explicitly stated author as an authorship claim: a known agent
+    /// name there marks the entry as an agent's — unless it is also the current username, which
+    /// is what a human's author defaults to and so says nothing (the same exception
+    /// [`History::is_agent`] applies). An explicit kind still wins over the inference.
+    #[rstest]
+    #[case::known_agent_name("pi", "raspberry:ellie", None, Some(AuthorKind::Agent))]
+    #[case::agent_name_is_the_username("pi", "raspberry:pi", None, None)]
+    #[case::human_name("ellie", "raspberry:ellie", None, None)]
+    #[case::explicit_kind_wins(
+        "pi",
+        "raspberry:pi",
+        Some(AuthorKind::Agent),
+        Some(AuthorKind::Agent)
+    )]
+    fn capture_infers_agent_kind_from_an_explicit_author(
+        #[case] author: &str,
+        #[case] origin: &str,
+        #[case] stated_kind: Option<AuthorKind>,
+        #[case] expected: Option<AuthorKind>,
+    ) {
+        let history: History = History::capture()
+            .timestamp(time::OffsetDateTime::now_utc())
+            .command("git status")
+            .cwd("/")
+            .author(author)
+            .cmd_origin(CmdOrigin::try_from(origin.to_owned()).unwrap())
+            .author_kind_opt(stated_kind)
+            .build()
+            .into();
+        assert_eq!(history.author_kind, expected);
+    }
+
+    #[rstest]
     fn known_agents_include_pi() {
+        let agents = OrFilter::from_list(vec![AuthorPattern::AllAgent]).unwrap();
+        let users = OrFilter::from_list(vec![AuthorPattern::AllUser]).unwrap();
+        let pi = entry("pi", "raspberry:ellie", None);
+        let ellie = entry("ellie", "raspberry:ellie", None);
+
         assert!(is_known_agent("pi"));
-        assert!(author_matches_filters(
-            "pi",
-            &[AUTHOR_FILTER_ALL_AGENT.to_string()]
-        ));
-        assert!(!author_matches_filters(
-            "pi",
-            &[AUTHOR_FILTER_ALL_USER.to_string()]
-        ));
+        assert!(author_matches_filters(&pi, agents.as_slice_filter()));
+        assert!(!author_matches_filters(&pi, users.as_slice_filter()));
+        assert!(!author_matches_filters(&ellie, agents.as_slice_filter()));
+        assert!(author_matches_filters(&ellie, users.as_slice_filter()));
     }
 
-    #[test]
+    #[rstest]
+    fn an_all_author_filter_matches_everyone() {
+        let all = OrFilter::all();
+        assert!(author_matches_filters(&entry("pi", "raspberry:ellie", None), all));
+        assert!(author_matches_filters(&entry("ellie", "raspberry:ellie", None), all));
+    }
+
+    #[rstest]
+    fn the_all_user_filter_excludes_agents() {
+        let filter = all_user_author_filter();
+        assert!(!author_matches_filters(&entry("pi", "raspberry:ellie", None), filter));
+        assert!(author_matches_filters(&entry("ellie", "raspberry:ellie", None), filter));
+    }
+
+    /// An agent name is only evidence of an agent when it is not also the username: a user called
+    /// `pi` gets `pi` as their author by default, and is not the `pi` agent.
+    #[rstest]
+    #[case::agent_name_on_another_users_machine("pi", "raspberry:ellie", None, true)]
+    #[case::agent_name_is_the_username("pi", "raspberry:pi", None, false)]
+    #[case::plain_user("ellie", "raspberry:ellie", None, false)]
+    #[case::hostname_without_a_username("pi", "raspberry", None, true)]
+    #[case::colonless_hostname_is_the_agent_name("pi", "pi", None, false)]
+    // A stated kind is authoritative, which is the only way to tell the `pi` agent apart from the
+    // `pi` user on their own machine.
+    #[case::stated_agent("pi", "raspberry:pi", Some(AuthorKind::Agent), true)]
+    #[case::stated_user("pi", "raspberry:ellie", Some(AuthorKind::User), false)]
+    #[case::stated_agent_with_a_human_name(
+        "ellie",
+        "raspberry:ellie",
+        Some(AuthorKind::Agent),
+        true
+    )]
+    fn is_agent_uses_the_username_when_no_kind_was_stated(
+        #[case] author: &str,
+        #[case] origin: &str,
+        #[case] author_kind: Option<AuthorKind>,
+        #[case] expected: bool,
+    ) {
+        assert_eq!(entry(author, origin, author_kind).is_agent(), expected);
+    }
+
+    #[rstest]
     fn disable_secrets() {
         let settings = Settings {
             secrets_filter: false,
@@ -636,121 +932,156 @@ mod tests {
         assert!(stripe_key.should_save(&settings));
     }
 
-    #[test]
-    fn test_serialize_deserialize() {
-        let history = History {
-            id: "66d16cbee7cd47538e5c5b8b44e9006e".to_owned().into(),
-            timestamp: datetime!(2023-05-28 18:35:40.633872 +00:00),
-            duration: 49206000,
-            exit: 0,
-            command: "git status".to_owned(),
-            cwd: "/Users/conrad.ludgate/Documents/code/atuin".to_owned(),
-            session: "b97d9a306f274473a203d2eba41f9457".to_owned(),
-            hostname: "fvfg936c0kpf:conrad.ludgate".to_owned(),
-            author: "conrad.ludgate".to_owned(),
-            intent: None,
-            deleted_at: None,
-        };
-
+    #[rstest]
+    #[case::basic(History {
+        id: "66d16cbee7cd47538e5c5b8b44e9006e".parse().unwrap(),
+        timestamp: datetime!(2023-05-28 18:35:40.633872 +00:00),
+        duration: 49_206_000,
+        exit: 0,
+        command: "git status".to_owned(),
+        cwd: "/Users/conrad.ludgate/Documents/code/atuin".to_owned(),
+        session: "b97d9a306f274473a203d2eba41f9457".to_owned(),
+        cmd_origin: CmdOrigin::try_from("fvfg936c0kpf:conrad.ludgate").unwrap(),
+        author: "conrad.ludgate".to_owned(),
+        intent: None,
+        deleted_at: None,
+        shell: None,
+        author_kind: None,
+    })]
+    #[case::deleted(History {
+        id: "66d16cbee7cd47538e5c5b8b44e9006e".parse().unwrap(),
+        timestamp: datetime!(2023-05-28 18:35:40.633872 +00:00),
+        duration: 49_206_000,
+        exit: 0,
+        command: "git status".to_owned(),
+        cwd: "/Users/conrad.ludgate/Documents/code/atuin".to_owned(),
+        session: "b97d9a306f274473a203d2eba41f9457".to_owned(),
+        cmd_origin: CmdOrigin::try_from("fvfg936c0kpf:conrad.ludgate").unwrap(),
+        author: "conrad.ludgate".to_owned(),
+        intent: None,
+        deleted_at: Some(datetime!(2023-11-19 20:18 +00:00)),
+        shell: Some("bash".into()),
+        author_kind: Some(AuthorKind::User),
+    })]
+    #[case::with_author_and_intent(History {
+        id: "66d16cbee7cd47538e5c5b8b44e9006e".parse().unwrap(),
+        timestamp: datetime!(2023-05-28 18:35:40.633872 +00:00),
+        duration: 49_206_000,
+        exit: 0,
+        command: "git status".to_owned(),
+        cwd: "/Users/conrad.ludgate/Documents/code/atuin".to_owned(),
+        session: "b97d9a306f274473a203d2eba41f9457".to_owned(),
+        cmd_origin: CmdOrigin::try_from("fvfg936c0kpf:conrad.ludgate").unwrap(),
+        author: "claude".to_owned(),
+        intent: Some("check repository status".to_owned()),
+        deleted_at: None,
+        shell: Some("fish".into()),
+        author_kind: Some(AuthorKind::Agent),
+    })]
+    fn serialize_deserialize_roundtrip(#[case] history: History) {
         let serialized = history.serialize().expect("failed to serialize history");
-        assert_eq!(
-            &serialized.0[0..3],
-            [205, 0, 1],
-            "should encode as history v1"
-        );
+        assert_eq!(&serialized.0[0..3], [205, 0, 2], "should encode as history v2");
 
-        let deserialized = History::deserialize(&serialized.0, HISTORY_VERSION)
+        let deserialized = History::deserialize(&serialized.0, Version::LATEST.name())
             .expect("failed to deserialize history");
         assert_eq!(history, deserialized);
     }
 
-    #[test]
-    fn test_serialize_deserialize_deleted() {
-        let history = History {
-            id: "66d16cbee7cd47538e5c5b8b44e9006e".to_owned().into(),
+    const BYTES_V0: &[u8] = &[
+        205, 0, 0, 153, 217, 32, 54, 54, 100, 49, 54, 99, 98, 101, 101, 55, 99, 100, 52, 55, 53,
+        51, 56, 101, 53, 99, 53, 98, 56, 98, 52, 52, 101, 57, 48, 48, 54, 101, 207, 23, 99, 98,
+        117, 24, 210, 246, 128, 206, 2, 238, 210, 240, 0, 170, 103, 105, 116, 32, 115, 116, 97,
+        116, 117, 115, 217, 42, 47, 85, 115, 101, 114, 115, 47, 99, 111, 110, 114, 97, 100, 46,
+        108, 117, 100, 103, 97, 116, 101, 47, 68, 111, 99, 117, 109, 101, 110, 116, 115, 47, 99,
+        111, 100, 101, 47, 97, 116, 117, 105, 110, 217, 32, 98, 57, 55, 100, 57, 97, 51, 48, 54,
+        102, 50, 55, 52, 52, 55, 51, 97, 50, 48, 51, 100, 50, 101, 98, 97, 52, 49, 102, 57, 52, 53,
+        55, 187, 102, 118, 102, 103, 57, 51, 54, 99, 48, 107, 112, 102, 58, 99, 111, 110, 114, 97,
+        100, 46, 108, 117, 100, 103, 97, 116, 101, 192,
+    ];
+
+    const BYTES_V1: &[u8] = &[
+        205, 0, 1, 155, 217, 32, 54, 54, 100, 49, 54, 99, 98, 101, 101, 55, 99, 100, 52, 55, 53,
+        51, 56, 101, 53, 99, 53, 98, 56, 98, 52, 52, 101, 57, 48, 48, 54, 101, 207, 23, 99, 98,
+        117, 24, 210, 246, 128, 206, 2, 238, 210, 240, 0, 170, 103, 105, 116, 32, 115, 116, 97,
+        116, 117, 115, 217, 42, 47, 85, 115, 101, 114, 115, 47, 99, 111, 110, 114, 97, 100, 46,
+        108, 117, 100, 103, 97, 116, 101, 47, 68, 111, 99, 117, 109, 101, 110, 116, 115, 47, 99,
+        111, 100, 101, 47, 97, 116, 117, 105, 110, 217, 32, 98, 57, 55, 100, 57, 97, 51, 48, 54,
+        102, 50, 55, 52, 52, 55, 51, 97, 50, 48, 51, 100, 50, 101, 98, 97, 52, 49, 102, 57, 52, 53,
+        55, 187, 102, 118, 102, 103, 57, 51, 54, 99, 48, 107, 112, 102, 58, 99, 111, 110, 114, 97,
+        100, 46, 108, 117, 100, 103, 97, 116, 101, 207, 24, 194, 83, 235, 108, 206, 10, 0, 174, 99,
+        111, 110, 114, 97, 100, 46, 108, 117, 100, 103, 97, 116, 101, 173, 115, 97, 109, 112, 108,
+        101, 32, 105, 110, 116, 101, 110, 116,
+    ];
+
+    fn expected_v2() -> History {
+        History {
+            id: "66d16cbee7cd47538e5c5b8b44e9006e".parse().unwrap(),
             timestamp: datetime!(2023-05-28 18:35:40.633872 +00:00),
-            duration: 49206000,
+            duration: 49_206_000,
             exit: 0,
             command: "git status".to_owned(),
             cwd: "/Users/conrad.ludgate/Documents/code/atuin".to_owned(),
             session: "b97d9a306f274473a203d2eba41f9457".to_owned(),
-            hostname: "fvfg936c0kpf:conrad.ludgate".to_owned(),
+            cmd_origin: CmdOrigin::try_from("fvfg936c0kpf:conrad.ludgate").unwrap(),
             author: "conrad.ludgate".to_owned(),
-            intent: None,
-            deleted_at: Some(datetime!(2023-11-19 20:18 +00:00)),
-        };
-
-        let serialized = history.serialize().expect("failed to serialize history");
-
-        let deserialized = History::deserialize(&serialized.0, HISTORY_VERSION)
-            .expect("failed to deserialize history");
-
-        assert_eq!(history, deserialized);
+            intent: Some("sample intent".to_owned()),
+            deleted_at: Some(time::OffsetDateTime::from_unix_timestamp(1_784_080_673).unwrap()),
+            shell: Some("zsh".into()),
+            author_kind: None,
+        }
     }
 
-    #[test]
-    fn test_serialize_deserialize_with_author_and_intent() {
-        let history = History {
-            id: "66d16cbee7cd47538e5c5b8b44e9006e".to_owned().into(),
-            timestamp: datetime!(2023-05-28 18:35:40.633872 +00:00),
-            duration: 49206000,
-            exit: 0,
-            command: "git status".to_owned(),
-            cwd: "/Users/conrad.ludgate/Documents/code/atuin".to_owned(),
-            session: "b97d9a306f274473a203d2eba41f9457".to_owned(),
-            hostname: "fvfg936c0kpf:conrad.ludgate".to_owned(),
-            author: "claude".to_owned(),
-            intent: Some("check repository status".to_owned()),
-            deleted_at: None,
-        };
-
-        let serialized = history.serialize().expect("failed to serialize history");
-        let deserialized = History::deserialize(&serialized.0, HISTORY_VERSION)
-            .expect("failed to deserialize history");
-
-        assert_eq!(history, deserialized);
+    fn expected_v1() -> History {
+        History {
+            shell: None,
+            ..expected_v2()
+        }
     }
 
-    #[test]
-    fn test_serialize_deserialize_version() {
-        // v0
-        let bytes_v0 = [
-            205, 0, 0, 153, 217, 32, 54, 54, 100, 49, 54, 99, 98, 101, 101, 55, 99, 100, 52, 55,
-            53, 51, 56, 101, 53, 99, 53, 98, 56, 98, 52, 52, 101, 57, 48, 48, 54, 101, 207, 23, 99,
-            98, 117, 24, 210, 246, 128, 206, 2, 238, 210, 240, 0, 170, 103, 105, 116, 32, 115, 116,
-            97, 116, 117, 115, 217, 42, 47, 85, 115, 101, 114, 115, 47, 99, 111, 110, 114, 97, 100,
-            46, 108, 117, 100, 103, 97, 116, 101, 47, 68, 111, 99, 117, 109, 101, 110, 116, 115,
-            47, 99, 111, 100, 101, 47, 97, 116, 117, 105, 110, 217, 32, 98, 57, 55, 100, 57, 97,
-            51, 48, 54, 102, 50, 55, 52, 52, 55, 51, 97, 50, 48, 51, 100, 50, 101, 98, 97, 52, 49,
-            102, 57, 52, 53, 55, 187, 102, 118, 102, 103, 57, 51, 54, 99, 48, 107, 112, 102, 58,
-            99, 111, 110, 114, 97, 100, 46, 108, 117, 100, 103, 97, 116, 101, 192,
-        ];
-
-        let deserialized = History::deserialize(&bytes_v0, "v0");
-        assert!(deserialized.is_ok());
-
-        let deserialized = History::deserialize(&bytes_v0, HISTORY_VERSION);
-        assert!(deserialized.is_err());
-
-        let current = History {
-            id: "66d16cbee7cd47538e5c5b8b44e9006e".to_owned().into(),
-            timestamp: datetime!(2023-05-28 18:35:40.633872 +00:00),
-            duration: 49206000,
-            exit: 0,
-            command: "git status".to_owned(),
-            cwd: "/Users/conrad.ludgate/Documents/code/atuin".to_owned(),
-            session: "b97d9a306f274473a203d2eba41f9457".to_owned(),
-            hostname: "fvfg936c0kpf:conrad.ludgate".to_owned(),
-            author: "conrad.ludgate".to_owned(),
+    fn expected_v0() -> History {
+        History {
             intent: None,
             deleted_at: None,
+            ..expected_v1()
+        }
+    }
+
+    /// A V2 record from before `author_kind` was appended: same version, one field short. New
+    /// fields are only read when the encoded array is long enough to hold them, so this must still
+    /// decode rather than error or misread the missing field.
+    #[rstest]
+    fn deserialize_v2_written_without_author_kind() {
+        let history = History {
+            author_kind: Some(AuthorKind::Agent),
+            ..expected_v2()
         };
+        let mut bytes = history.serialize().unwrap().0;
 
-        let bytes_v1 = current.serialize().expect("failed to serialize history");
-        let deserialized = History::deserialize(&bytes_v1.0, HISTORY_VERSION);
-        assert!(deserialized.is_ok());
+        assert_eq!(bytes[3], 0x90 | 13, "v2 should encode 13 fields");
+        bytes[3] = 0x90 | 12;
+        bytes.pop();
 
-        let deserialized = History::deserialize(&bytes_v1.0, "v0");
-        assert!(deserialized.is_err());
+        assert_eq!(History::deserialize(&bytes, Version::Two.name()).unwrap(), History {
+            author_kind: None,
+            ..history
+        });
+    }
+
+    #[rstest]
+    #[case::from_v0(Version::Zero, BYTES_V0, expected_v0())]
+    #[case::from_v1(Version::One, BYTES_V1, expected_v1())]
+    #[case::from_v2(Version::Two, &expected_v2().serialize().unwrap(), expected_v2())]
+    fn deserialize_across_versions(
+        #[case] source: Version,
+        #[case] bytes: &[u8],
+        #[case] expected: History,
+        #[values(Version::Zero, Version::One, Version::Two)] decode_as: Version,
+    ) {
+        let got = History::deserialize(bytes, decode_as.name());
+        if decode_as == source {
+            assert_eq!(got.unwrap(), expected, "{decode_as}");
+        } else {
+            assert!(got.is_err(), "unexpected success deserializing as {decode_as}");
+        }
     }
 }

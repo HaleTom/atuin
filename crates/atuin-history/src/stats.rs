@@ -1,10 +1,12 @@
 use std::collections::{HashMap, HashSet};
 
+use atuin_client::history::History;
+use atuin_client::settings::Settings;
+use atuin_client::theme::{Meaning, Theme};
 use crossterm::style::{Color, ResetColor, SetAttribute, SetForegroundColor};
+use easy_cast::Conv;
 use serde::{Deserialize, Serialize};
 use unicode_segmentation::UnicodeSegmentation;
-
-use atuin_client::{history::History, settings::Settings, theme::Meaning, theme::Theme};
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Stats {
@@ -29,7 +31,14 @@ fn first_whitespace(s: &str) -> usize {
         .map_or(s.len(), |(i, _)| i)
 }
 
-fn interesting_command<'a>(settings: &Settings, mut command: &'a str) -> &'a str {
+/// Split off the longest configured common prefix, returning the matched prefix
+/// and the remainder with leading whitespace removed. Both slices borrow from
+/// `command`; an empty remainder means the command consists only of the prefix.
+#[must_use]
+pub fn split_common_prefix<'a>(
+    settings: &Settings,
+    command: &'a str,
+) -> Option<(&'a str, &'a str)> {
     // Sort by length so that we match the longest prefix first
     let mut common_prefix = settings.stats.common_prefix.clone();
     common_prefix.sort_by_key(|b| std::cmp::Reverse(b.len()));
@@ -38,14 +47,19 @@ fn interesting_command<'a>(settings: &Settings, mut command: &'a str) -> &'a str
     for p in &common_prefix {
         if command.starts_with(p) {
             let i = p.len();
-            let prefix = &command[..i];
-            command = command[i..].trim_start();
-            if command.is_empty() {
-                // no commands following, just use the prefix
-                return prefix;
-            }
-            break;
+            return Some((&command[..i], command[i..].trim_start()));
         }
+    }
+    None
+}
+
+fn interesting_command<'a>(settings: &Settings, mut command: &'a str) -> &'a str {
+    if let Some((prefix, remainder)) = split_common_prefix(settings, command) {
+        if remainder.is_empty() {
+            // no commands following, just use the prefix
+            return prefix;
+        }
+        command = remainder;
     }
 
     // Sort the common_subcommands by length so that we match the longest subcommand first
@@ -164,7 +178,7 @@ fn strip_leading_env_vars(command: &str) -> &str {
 
 pub fn pretty_print(stats: Stats, ngram_size: usize, theme: &Theme) {
     let max = stats.top.iter().map(|x| x.1).max().unwrap();
-    let num_pad = max.ilog10() as usize + 1;
+    let num_pad = usize::conv(max.ilog10()) + 1;
 
     // Find the length of the longest command name for each column
     let column_widths = stats
@@ -172,10 +186,7 @@ pub fn pretty_print(stats: Stats, ngram_size: usize, theme: &Theme) {
         .iter()
         .map(|(commands, _)| commands.iter().map(|c| c.len()).collect::<Vec<usize>>())
         .fold(vec![0; ngram_size], |acc, item| {
-            acc.iter()
-                .zip(item.iter())
-                .map(|(a, i)| *std::cmp::max(a, i))
-                .collect()
+            acc.iter().zip(item.iter()).map(|(a, i)| *std::cmp::max(a, i)).collect()
         });
 
     for (command, count) in stats.top {
@@ -232,13 +243,15 @@ pub fn pretty_print(stats: Stats, ngram_size: usize, theme: &Theme) {
             .join(" | ");
 
         println!(
-            "{ResetColor}] {gray}{count:num_pad$}{ResetColor} {bold}{formatted_command}{ResetColor}"
+            "{ResetColor}] {gray}{count:num_pad$}{ResetColor} \
+             {bold}{formatted_command}{ResetColor}"
         );
     }
     println!("Total commands:   {}", stats.total_commands);
     println!("Unique commands:  {}", stats.unique_commands);
 }
 
+#[must_use]
 pub fn compute(
     settings: &Settings,
     history: &[History],
@@ -301,12 +314,14 @@ pub fn compute(
 mod tests {
     use atuin_client::history::History;
     use atuin_client::settings::Settings;
+    use rstest::*;
     use time::OffsetDateTime;
 
-    use super::compute;
-    use super::{interesting_command, split_at_pipe, strip_leading_env_vars};
+    use super::{
+        compute, interesting_command, split_at_pipe, split_common_prefix, strip_leading_env_vars,
+    };
 
-    #[test]
+    #[rstest]
     fn ignored_env_vars() {
         let settings = Settings::utc();
 
@@ -321,17 +336,13 @@ mod tests {
         assert_eq!(stats.top.first().unwrap().0, vec!["echo"]);
     }
 
-    #[test]
+    #[rstest]
     fn ignored_commands() {
         let mut settings = Settings::utc();
         settings.stats.ignored_commands.push("cd".to_string());
 
         let history = [
-            History::import()
-                .timestamp(OffsetDateTime::now_utc())
-                .command("cd foo")
-                .build()
-                .into(),
+            History::import().timestamp(OffsetDateTime::now_utc()).command("cd foo").build().into(),
             History::import()
                 .timestamp(OffsetDateTime::now_utc())
                 .command("cargo build stuff")
@@ -344,205 +355,136 @@ mod tests {
         assert_eq!(stats.unique_commands, 1);
     }
 
-    #[test]
-    fn interesting_commands() {
-        let settings = Settings::utc();
+    #[rstest]
+    fn all_commands_ignored() {
+        let mut settings = Settings::utc();
+        settings.stats.ignored_commands.push("cd".to_string());
 
-        assert_eq!(interesting_command(&settings, "cargo"), "cargo");
-        assert_eq!(
-            interesting_command(&settings, "cargo build foo bar"),
-            "cargo build"
-        );
-        assert_eq!(
-            interesting_command(&settings, "sudo   cargo build foo bar"),
-            "cargo build"
-        );
-        assert_eq!(interesting_command(&settings, "sudo"), "sudo");
+        let history = [History::import()
+            .timestamp(OffsetDateTime::now_utc())
+            .command("cd foo")
+            .build()
+            .into()];
+
+        // non-empty history can still leave nothing to report, so callers have
+        // to handle None rather than assuming history.is_empty() covers it
+        assert!(compute(&settings, &history, 10, 1).is_none());
+    }
+
+    #[fixture]
+    fn settings(
+        #[default(&[][..])] prefix: &[&str],
+        #[default(&[][..])] subcommand: &[&str],
+    ) -> Settings {
+        let mut s = Settings::utc();
+        s.stats.common_prefix.extend(prefix.iter().map(|p| p.to_string()));
+        s.stats.common_subcommands.extend(subcommand.iter().map(|p| p.to_string()));
+        s
+    }
+
+    #[rstest]
+    #[case::bare("cargo", "cargo")]
+    #[case::with_subcommand("cargo build foo bar", "cargo build")]
+    #[case::with_prefix("sudo   cargo build foo bar", "cargo build")]
+    #[case::prefix_only("sudo", "sudo")]
+    fn interesting_commands(#[case] input: &str, #[case] expected: &str) {
+        let settings = Settings::utc();
+        assert_eq!(interesting_command(&settings, input), expected);
+    }
+
+    #[rstest]
+    #[case::no_match("echo hello", None)]
+    #[case::prefix("sudo echo hello", Some(("sudo", "echo hello")))]
+    #[case::longest("sudo test echo hello", Some(("sudo test", "echo hello")))]
+    #[case::prefix_only("sudo test", Some(("sudo test", "")))]
+    #[case::trailing_whitespace("sudo test \t ", Some(("sudo test", "")))]
+    #[case::one_removal("sudo doas echo", Some(("sudo", "doas echo")))]
+    #[case::partial_word("sudoedit file", Some(("sudo", "edit file")))]
+    fn splits_common_prefix(
+        #[with(&["sudo test"][..])] settings: Settings,
+        #[case] command: &str,
+        #[case] expected: Option<(&str, &str)>,
+    ) {
+        assert_eq!(split_common_prefix(&settings, command), expected);
     }
 
     // Test with spaces in the common_prefix
-    #[test]
-    fn interesting_commands_spaces() {
-        let mut settings = Settings::utc();
-        settings.stats.common_prefix.push("sudo test".to_string());
-
-        assert_eq!(interesting_command(&settings, "sudo test"), "sudo test");
-        assert_eq!(interesting_command(&settings, "sudo test  "), "sudo test");
-        assert_eq!(interesting_command(&settings, "sudo test foo bar"), "foo");
-        assert_eq!(
-            interesting_command(&settings, "sudo test    foo bar"),
-            "foo"
-        );
-
-        // Works with a common_subcommand as well
-        assert_eq!(
-            interesting_command(&settings, "sudo test cargo build foo bar"),
-            "cargo build"
-        );
-
-        // We still match on just the sudo prefix
-        assert_eq!(interesting_command(&settings, "sudo"), "sudo");
-        assert_eq!(interesting_command(&settings, "sudo foo"), "foo");
+    #[rstest]
+    #[case::exact("sudo test", "sudo test")]
+    #[case::trailing_spaces("sudo test  ", "sudo test")]
+    #[case::following_word("sudo test foo bar", "foo")]
+    #[case::following_word_extra_spaces("sudo test    foo bar", "foo")]
+    #[case::with_subcommand("sudo test cargo build foo bar", "cargo build")]
+    #[case::prefix_alone("sudo", "sudo")]
+    #[case::prefix_word("sudo foo", "foo")]
+    fn interesting_commands_spaces(
+        #[with(&["sudo test"][..])] settings: Settings,
+        #[case] input: &str,
+        #[case] expected: &str,
+    ) {
+        assert_eq!(interesting_command(&settings, input), expected);
     }
 
     // Test with spaces in the common_subcommand
-    #[test]
-    fn interesting_commands_spaces_subcommand() {
-        let mut settings = Settings::utc();
-        settings
-            .stats
-            .common_subcommands
-            .push("cargo build".to_string());
-
-        assert_eq!(interesting_command(&settings, "cargo build"), "cargo build");
-        assert_eq!(
-            interesting_command(&settings, "cargo build   "),
-            "cargo build"
-        );
-        assert_eq!(
-            interesting_command(&settings, "cargo build foo bar"),
-            "cargo build foo"
-        );
-
-        // Works with a common_prefix as well
-        assert_eq!(
-            interesting_command(&settings, "sudo cargo build foo bar"),
-            "cargo build foo"
-        );
-
-        // We still match on just cargo as a subcommand
-        assert_eq!(interesting_command(&settings, "cargo"), "cargo");
-        assert_eq!(interesting_command(&settings, "cargo foo"), "cargo foo");
+    #[rstest]
+    #[case::exact("cargo build", "cargo build")]
+    #[case::trailing_spaces("cargo build   ", "cargo build")]
+    #[case::following_word("cargo build foo bar", "cargo build foo")]
+    #[case::with_prefix("sudo cargo build foo bar", "cargo build foo")]
+    #[case::subcommand_alone("cargo", "cargo")]
+    #[case::subcommand_word("cargo foo", "cargo foo")]
+    fn interesting_commands_spaces_subcommand(
+        #[with(&[][..], &["cargo build"][..])] settings: Settings,
+        #[case] input: &str,
+        #[case] expected: &str,
+    ) {
+        assert_eq!(interesting_command(&settings, input), expected);
     }
 
     // Test with spaces in the common_prefix and common_subcommand
-    #[test]
-    fn interesting_commands_spaces_both() {
-        let mut settings = Settings::utc();
-        settings.stats.common_prefix.push("sudo test".to_string());
-        settings
-            .stats
-            .common_subcommands
-            .push("cargo build".to_string());
-
-        assert_eq!(
-            interesting_command(&settings, "sudo test cargo build"),
-            "cargo build"
-        );
-        assert_eq!(
-            interesting_command(&settings, "sudo test   cargo build"),
-            "cargo build"
-        );
-        assert_eq!(
-            interesting_command(&settings, "sudo test cargo build   "),
-            "cargo build"
-        );
-        assert_eq!(
-            interesting_command(&settings, "sudo test cargo build foo bar"),
-            "cargo build foo"
-        );
+    #[rstest]
+    #[case::exact("sudo test cargo build", "cargo build")]
+    #[case::prefix_extra_spaces("sudo test   cargo build", "cargo build")]
+    #[case::trailing_spaces("sudo test cargo build   ", "cargo build")]
+    #[case::following_word("sudo test cargo build foo bar", "cargo build foo")]
+    fn interesting_commands_spaces_both(
+        #[with(&["sudo test"][..], &["cargo build"][..])] settings: Settings,
+        #[case] input: &str,
+        #[case] expected: &str,
+    ) {
+        assert_eq!(interesting_command(&settings, input), expected);
     }
 
-    #[test]
-    fn split_simple() {
-        assert_eq!(split_at_pipe("fd | rg"), ["fd ", " rg"]);
+    #[rstest]
+    #[case::simple("fd | rg", &["fd ", " rg"])]
+    #[case::multi("kubectl | jq | rg", &["kubectl ", " jq ", " rg"])]
+    #[case::simple_quoted(
+        "foo | bar 'baz {} | quux' | xyzzy",
+        &["foo ", " bar 'baz {} | quux' ", " xyzzy"]
+    )]
+    #[case::multi_quoted(
+        "foo | bar 'baz \"{}\" | quux' | xyzzy",
+        &["foo ", " bar 'baz \"{}\" | quux' ", " xyzzy"]
+    )]
+    #[case::escaped_pipes("foo | bar baz \\| quux", &["foo ", " bar baz \\| quux"])]
+    #[case::emoji("git commit -m \"🚀\"", &["git commit -m \"🚀\""])]
+    #[case::starts_with_pipe("| sed 's/[0-9a-f]//g'", &["", " sed 's/[0-9a-f]//g'"])]
+    #[case::starts_with_spaces_and_pipe("  | sed 's/[0-9a-f]//g'", &["  ", " sed 's/[0-9a-f]//g'"])]
+    fn splits_at_pipe(#[case] input: &str, #[case] expected: &[&str]) {
+        assert_eq!(split_at_pipe(input), expected);
     }
 
-    #[test]
-    fn split_multi() {
-        assert_eq!(
-            split_at_pipe("kubectl | jq | rg"),
-            ["kubectl ", " jq ", " rg"]
-        );
-    }
-
-    #[test]
-    fn split_simple_quoted() {
-        assert_eq!(
-            split_at_pipe("foo | bar 'baz {} | quux' | xyzzy"),
-            ["foo ", " bar 'baz {} | quux' ", " xyzzy"]
-        );
-    }
-
-    #[test]
-    fn split_multi_quoted() {
-        assert_eq!(
-            split_at_pipe("foo | bar 'baz \"{}\" | quux' | xyzzy"),
-            ["foo ", " bar 'baz \"{}\" | quux' ", " xyzzy"]
-        );
-    }
-
-    #[test]
-    fn escaped_pipes() {
-        assert_eq!(
-            split_at_pipe("foo | bar baz \\| quux"),
-            ["foo ", " bar baz \\| quux"]
-        );
-    }
-
-    #[test]
-    fn emoji() {
-        assert_eq!(
-            split_at_pipe("git commit -m \"🚀\""),
-            ["git commit -m \"🚀\""]
-        );
-    }
-
-    #[test]
-    fn starts_with_pipe() {
-        assert_eq!(
-            split_at_pipe("| sed 's/[0-9a-f]//g'"),
-            ["", " sed 's/[0-9a-f]//g'"]
-        );
-    }
-
-    #[test]
-    fn starts_with_spaces_and_pipe() {
-        assert_eq!(
-            split_at_pipe("  | sed 's/[0-9a-f]//g'"),
-            ["  ", " sed 's/[0-9a-f]//g'"]
-        );
-    }
-
-    #[test]
-    fn strip_leading_env_vars_simple() {
-        assert_eq!(
-            strip_leading_env_vars("FOO=bar BAZ=quux echo foo"),
-            "echo foo"
-        );
-    }
-
-    #[test]
-    fn strip_leading_env_vars_quoted_single() {
-        assert_eq!(strip_leading_env_vars("FOO='BAR=baz' echo foo"), "echo foo");
-    }
-
-    #[test]
-    fn strip_leading_env_vars_quoted_double() {
-        assert_eq!(
-            strip_leading_env_vars("FOO=\"BAR=baz\" echo foo"),
-            "echo foo"
-        );
-    }
-
-    #[test]
-    fn strip_leading_env_vars_quoted_single_and_double() {
-        assert_eq!(
-            strip_leading_env_vars("FOO='BAR=\"baz\"' echo foo \"BAR=quux\""),
-            "echo foo \"BAR=quux\""
-        );
-    }
-
-    #[test]
-    fn strip_leading_env_vars_emojis() {
-        assert_eq!(
-            strip_leading_env_vars("FOO='BAR=🚀' echo foo \"BAR=quux\" foo"),
-            "echo foo \"BAR=quux\" foo"
-        );
-    }
-
-    #[test]
-    fn strip_leading_env_vars_name_same_as_command() {
-        assert_eq!(strip_leading_env_vars("FOO='bar' bar baz"), "bar baz");
+    #[rstest]
+    #[case::simple("FOO=bar BAZ=quux echo foo", "echo foo")]
+    #[case::quoted_single("FOO='BAR=baz' echo foo", "echo foo")]
+    #[case::quoted_double("FOO=\"BAR=baz\" echo foo", "echo foo")]
+    #[case::quoted_single_and_double(
+        "FOO='BAR=\"baz\"' echo foo \"BAR=quux\"",
+        "echo foo \"BAR=quux\""
+    )]
+    #[case::emojis("FOO='BAR=🚀' echo foo \"BAR=quux\" foo", "echo foo \"BAR=quux\" foo")]
+    #[case::name_same_as_command("FOO='bar' bar baz", "bar baz")]
+    fn strips_leading_env_vars(#[case] input: &str, #[case] expected: &str) {
+        assert_eq!(strip_leading_env_vars(input), expected);
     }
 }

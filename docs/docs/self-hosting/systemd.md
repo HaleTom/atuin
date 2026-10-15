@@ -1,4 +1,4 @@
-# Systemd
+# Running the Atuin server under systemd
 
 !!! note
     These instructions assume the `atuin-server` binary is on your `PATH`. Since
@@ -14,7 +14,7 @@ First, create the service unit file
 [Unit]
 Description=Start the Atuin server syncing service
 After=network-online.target
-Wants=network-online.target systemd-networkd-wait-online.service
+Wants=network-online.target
 
 [Service]
 ExecStart=atuin-server start
@@ -51,13 +51,13 @@ Next, create [`atuin-server.conf`](https://github.com/atuinsh/atuin/raw/main/sys
 ```
 u atuin - "Atuin synchronized shell history"
 ```
-This file will ensure a system user is created in the proper manner.
+This file will make sure a system user is created in the proper manner.
 
-Afterwards, run
+Afterward, run
 ```sh
 systemctl restart systemd-sysusers
 ```
-to make sure the file is read. A new `atuin-server` user should then be available.
+to make sure the file is read. A new `atuin` user should then be available.
 
 Now, you can attempt to run the Atuin server:
 ```sh

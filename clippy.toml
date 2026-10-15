@@ -1,0 +1,80 @@
+[[disallowed-methods]]
+path = "std::time::Duration::new"
+reason = """panics on overflow; use atuin_common::time::DurationExt::try_new, or \
+    Duration::from_secs when nanos are 0"""
+
+[[disallowed-methods]]
+path = "time::SignedDuration::new"
+reason = "panics on overflow; use atuin_common::time::DurationExt::try_new"
+
+[[disallowed-methods]]
+path = "std::time::Duration::from_secs_f64"
+reason = "panics on NaN/negative/overflow; use Duration::try_from_secs_f64"
+
+[[disallowed-methods]]
+path = "std::env::var"
+reason = "use atuin_common::env::var, which can be mocked by tests"
+
+[[disallowed-methods]]
+path = "std::env::var_os"
+reason = "use atuin_common::env::var_os, which can be mocked by tests"
+
+[[disallowed-methods]]
+path = "std::env::set_var"
+reason = "unsound; in tests, use atuin_common::env::MockEnv"
+
+[[disallowed-methods]]
+path = "std::env::remove_var"
+reason = "unsound; in tests, use atuin_common::env::MockEnv"
+
+[[disallowed-types]]
+path = "std::sync::Mutex"
+reason = "use parking_lot::Mutex which is faster"
+
+[[disallowed-types]]
+path = "std::sync::MutexGuard"
+reason = "use parking_lot::MutexGuard which is faster"
+
+[[disallowed-types]]
+path = "std::sync::RwLock"
+reason = "use parking_lot::RwLock which is faster"
+
+[[disallowed-types]]
+path = "std::sync::RwLockReadGuard"
+reason = "use parking_lot::RwLockReadGuard which is faster"
+
+[[disallowed-types]]
+path = "std::sync::RwLockWriteGuard"
+reason = "use parking_lot::RwLockWriteGuard which is faster"
+
+[[disallowed-types]]
+path = "std::sync::Condvar"
+reason = "use parking_lot::Condvar which is faster"
+
+[[disallowed-types]]
+path = "std::sync::Once"
+reason = "use parking_lot::Once which is faster"
+
+[[disallowed-types]]
+path = "std::sync::ReentrantLock"
+reason = "use parking_lot::ReentrantMutex which is faster"
+
+[[disallowed-methods]]
+path = "sqlx::query"
+reason = """use atuin_common::db::query, which forwards to sqlx::query and, in debug builds, \
+    rejects `SELECT *` and `ALTER` (a cached `SELECT *` whose column count changes under an \
+    ALTER panics in sqlx-sqlite)"""
+
+[[disallowed-methods]]
+path = "sqlx::query_as"
+reason = "use atuin_common::db::query_as; see the note on sqlx::query"
+
+[[disallowed-methods]]
+path = "sqlx::query_scalar"
+reason = "use atuin_common::db::query_scalar; see the note on sqlx::query"
+
+[[disallowed-macros]]
+path = "sqlx::migrate"
+reason = """use atuin_common::db::migrate!, which runs the migrator and then clears the \
+    connection's prepared-statement cache so a later query can't reuse pre-migration column \
+    metadata"""

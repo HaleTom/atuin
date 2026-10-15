@@ -1,6 +1,7 @@
 # pty-proxy
 
-Atuin pty-proxy is an experimental lightweight PTY proxy, providing new features without needing to replace your existing terminal or shell. It currently supports bash, zsh, fish, and nu.
+Atuin pty-proxy is an experimental lightweight PTY proxy, providing new features without needing to replace your existing terminal or shell. It currently supports bash, zsh, fish, and nu. See
+[Supported platforms](../support.md) for support tiers.
 
 !!! Note "Previously `atuin hex`"
 
@@ -10,11 +11,59 @@ Atuin pty-proxy is an experimental lightweight PTY proxy, providing new features
 
 The search TUI exposes a tradeoff: the UI is either in fullscreen alt-screen mode that takes over your terminal, or inline mode that clears your previous output. Neither is great.
 
-With pty-proxy, the Atuin popup renders over the top of your previous output, but when it's closed we can restore the output successfully.
+With pty-proxy, the Atuin popup renders over the top of your previous output, but when it's closed, pty-proxy restores the output successfully.
+
+!!! tip "Already using tmux?"
+
+    tmux can solve the same problem without pty-proxy: set
+    [`[tmux] enabled = true`](../configuration/config.md#tmux) and the search UI
+    opens in a popup above your pane, leaving the pane untouched.
+
+## Capturing command output
+
+Because pty-proxy sits between your terminal and your shell, it can also record
+what each command printed. It reads special escape sequences[^1] emitted by
+Atuin's shell integration to tell where one command's output ends and the next
+begins. It then hands each captured block to the [daemon](daemon.md), which
+holds it on disk, keyed by the command's Atuin history ID.
+
+[^1]: Atuin uses custom [OSC] escape sequences that begin with `OSC 18188735`.
+18188735 is `atuin` interpreted as a base-36 number; it was chosen to minimize
+conflicts with other programs and terminals.
+
+[OSC]: https://en.wikipedia.org/wiki/ANSI_escape_code#Operating_System_Command_sequences
+
+That capture is what lets AI tools see what actually happened, rather than
+guessing from the command alone:
+
+- [Atuin AI](../ai/introduction.md) can answer "why did that fail?" by reading
+  the real error, via its `AtuinOutput` tool
+- External agents such as Claude Code and Cursor can do the same through Atuin's
+  [MCP server](../ai/mcp.md)
+
+Output capture needs **both** pty-proxy and the daemon running. Nothing is
+captured by default. See [Capturing Command Output](../guide/output-capture.md)
+for setup, retention limits, and privacy.
 
 ## Initialization
 
-Atuin pty-proxy needs to be initialized separately from your existing Atuin config. Place the init line shown below in your shell's init script, as high in the document as possible, _before_ your normal `atuin init` call.
+The simplest way to enable pty-proxy is via your Atuin config (`~/.atuin/config.toml`) — no extra shell config needed:
+
+```toml
+[pty_proxy]
+enabled = true
+```
+
+With this set, your existing `atuin init` line starts the proxy automatically.
+
+!!! tip "Startup performance"
+
+    When enabled this way, the proxy starts wherever your `atuin init` line
+    sits, and everything sourced *before* that line runs a second time inside
+    the proxy. This is harmless, but for the fastest startup keep your
+    `atuin init` line as high in your shell config as possible.
+
+Alternatively, you can initialize pty-proxy explicitly in your shell config. Place the init line shown below as high in the document as possible, _before_ your normal `atuin init` call. Both methods can coexist safely — the proxy only starts once.
 
 === "zsh"
 
@@ -43,21 +92,21 @@ Atuin pty-proxy needs to be initialized separately from your existing Atuin conf
     Run in *Nushell*:
 
     ```shell
-    mkdir ~/.local/share/atuin/
-    atuin pty-proxy init nu | save -f ~/.local/share/atuin/pty-proxy-init.nu
+    mkdir ~/.atuin/
+    atuin pty-proxy init nu | save -f ~/.atuin/pty-proxy-init.nu
     ```
 
     Add to `config.nu`, **before** the regular `atuin init`:
 
     ```shell
-    source ~/.local/share/atuin/pty-proxy-init.nu
+    source ~/.atuin/pty-proxy-init.nu
     ```
     Nushell's `source` command requires a static file path, so you must
     pre-generate the file.
 
 ---
 
-If the `atuin` binary is not in your `PATH` by default, you should initialize pty-proxy as soon as it is set. For example, for a bash user with Atuin installed in `~/.atuin/bin/atuin`, a config file might look like this:
+If the `atuin` binary isn't in your `PATH` by default, you should initialize pty-proxy as soon as it's set. For example, for a bash user with Atuin installed in `~/.atuin/bin/atuin`, a config file might look like this:
 
 ```bash
 export PATH=$HOME/.atuin/bin:$PATH

@@ -4,9 +4,9 @@
 use std::path::PathBuf;
 
 use async_trait::async_trait;
-use directories::BaseDirs;
+use atuin_common::path::PathBufExt as _;
 use eyre::{Result, eyre};
-use time::OffsetDateTime;
+use time::{Duration, OffsetDateTime};
 
 use super::{Importer, Loader, unix_byte_lines};
 use crate::history::History;
@@ -17,11 +17,18 @@ pub struct Nu {
     bytes: Vec<u8>,
 }
 
-fn get_histpath() -> Result<PathBuf> {
-    let base = BaseDirs::new().ok_or_else(|| eyre!("could not determine data directory"))?;
-    let config_dir = base.config_dir().join("nushell");
+impl Nu {
+    fn num_entries(&self) -> usize {
+        super::count_lines(&self.bytes)
+    }
+}
 
-    let histpath = config_dir.join("history.txt");
+fn get_histpath() -> Result<PathBuf> {
+    let config_dir = dirs::config_dir()
+        .ok_or_else(|| eyre!("could not determine config directory"))?
+        .joined("nushell");
+
+    let histpath = config_dir.joined("history.txt");
     if histpath.exists() {
         Ok(histpath)
     } else {
@@ -39,25 +46,30 @@ impl Importer for Nu {
     }
 
     async fn entries(&mut self) -> Result<usize> {
-        Ok(super::count_lines(&self.bytes))
+        Ok(self.num_entries())
     }
 
     async fn load(self, h: &mut impl Loader) -> Result<()> {
-        let now = OffsetDateTime::now_utc();
+        // Separate commands by 1ms as with bash and zsh
+        let timestamp_increment = Duration::milliseconds(1);
 
-        let mut counter = 0;
+        // Subtract enough milliseconds so the most recent command's timestamp will be now.
+        let mut timestamp = OffsetDateTime::now_utc()
+            - timestamp_increment
+                * u32::try_from(self.num_entries().saturating_sub(1)).unwrap_or(u32::MAX);
+
         for b in unix_byte_lines(&self.bytes) {
-            let s = match std::str::from_utf8(b) {
-                Ok(s) => s,
-                Err(_) => continue, // we can skip past things like invalid utf8
+            let current_timestamp = timestamp;
+            timestamp += timestamp_increment;
+
+            // we can skip past things like invalid utf8
+            let Ok(s) = std::str::from_utf8(b) else {
+                continue;
             };
 
             let cmd: String = s.replace("<\\n>", "\n");
 
-            let offset = time::Duration::nanoseconds(counter);
-            counter += 1;
-
-            let entry = History::import().timestamp(now - offset).command(cmd);
+            let entry = History::import().shell("nu").timestamp(current_timestamp).command(cmd);
 
             h.push(entry.build().into()).await?;
         }

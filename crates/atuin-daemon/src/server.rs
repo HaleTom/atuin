@@ -1,37 +1,45 @@
+use atuin_client::settings::Settings;
+#[cfg(unix)]
+use eyre::Context;
 use eyre::Result;
 
-use crate::components::history::HistoryGrpcService;
 use crate::components::search::SearchGrpcService;
-use crate::control::{ControlService, control_server::ControlServer};
 use crate::daemon::DaemonHandle;
-use crate::history::history_server::HistoryServer;
+use crate::grpc;
+use crate::grpc::ai::session::pb::ai_session_server::AiSessionServer;
+use crate::grpc::history::pb::history_server::HistoryServer;
 use crate::search::search_server::SearchServer;
 
-use atuin_client::settings::Settings;
+/// How often to update the socket's modification time so it doesn't get automatically deleted by
+/// temporary file cleaners.
+#[cfg(unix)]
+const SOCKET_KEEPALIVE_INTERVAL: std::time::Duration = std::time::Duration::from_mins(1);
 
 /// Run the gRPC server with the given services.
 ///
 /// This starts the gRPC server in the background and returns immediately.
 /// The server will shut down when a ShutdownRequested event is received.
 #[cfg(unix)]
+#[allow(clippy::unused_async, reason = "needs to match the cfg(not(unix)) version")]
 pub async fn run_grpc_server(
-    settings: Settings,
-    history_service: HistoryServer<HistoryGrpcService>,
+    settings: &Settings,
+    history_service: HistoryServer<grpc::HistoryService>,
     search_service: SearchServer<SearchGrpcService>,
-    control_service: ControlServer<ControlService>,
+    ai_session_service: AiSessionServer<grpc::AiSessionService>,
     handle: DaemonHandle,
 ) -> Result<()> {
     use tokio::net::UnixListener;
     use tokio_stream::wrappers::UnixListenerStream;
 
-    let socket_path = settings.daemon.socket_path.clone();
+    let socket_path = settings.daemon.socket_path();
 
-    let (uds, cleanup) = if cfg!(target_os = "linux") && settings.daemon.systemd_socket {
+    let (uds, cleanup_path) = if cfg!(target_os = "linux") && settings.daemon.systemd_socket {
         #[cfg(target_os = "linux")]
         {
-            use eyre::{OptionExt, WrapErr};
             use std::os::unix::net::SocketAddr;
             use std::path::PathBuf;
+
+            use eyre::{OptionExt, WrapErr};
             tracing::info!("getting systemd socket");
             let listener = listenfd::ListenFd::from_env()
                 .take_unix_listener(0)?
@@ -48,28 +56,54 @@ pub async fn run_grpc_server(
             match actual_path {
                 Ok(actual_path) => {
                     tracing::info!("listening on systemd socket: {actual_path:?}");
-                    if actual_path != std::path::Path::new(&socket_path) {
+                    if actual_path != socket_path.as_path() {
                         tracing::warn!(
-                            "systemd socket is not at configured client path: {socket_path:?}"
+                            "systemd socket is not at configured client path: {:?}",
+                            socket_path.as_path(),
                         );
                     }
                 }
                 Err(err) => {
                     tracing::warn!(
-                        "could not detect systemd socket path, ensure that it's at the configured path: {socket_path:?}, error: {err:?}"
+                        "could not detect systemd socket path, ensure that it's at the configured \
+                         path: {:?}, error: {err:?}",
+                        socket_path.as_path(),
                     );
                 }
             }
-            (UnixListener::from_std(listener)?, false)
+            (UnixListener::from_std(listener)?, None)
         }
         #[cfg(not(target_os = "linux"))]
         unreachable!()
     } else {
-        tracing::info!("listening on unix socket {socket_path:?}");
-        (UnixListener::bind(socket_path.clone())?, true)
+        use atuin_common::path::DisplayRichExt;
+
+        socket_path.create_default_dir_if_needed()?;
+        tracing::info!("listening on unix socket {:?}", socket_path.as_path());
+        (
+            UnixListener::bind(&socket_path).context(format!(
+                "reading socket: {}",
+                socket_path.display_rich().relative_to_cwd()
+            ))?,
+            Some(socket_path.into_owned()),
+        )
     };
 
     let uds_stream = UnixListenerStream::new(uds);
+
+    // Periodically update the socket's modification time so it doesn't get automatically deleted by
+    // temporary file cleaners.
+    let socket_updater = cleanup_path.clone().map(|path| {
+        tokio::spawn(async move {
+            let mut interval = tokio::time::interval(SOCKET_KEEPALIVE_INTERVAL);
+            loop {
+                interval.tick().await;
+                if let Err(e) = atuin_common::os::unix::touch_file(&path) {
+                    tracing::warn!("failed to refresh {}: {e}", path.display());
+                }
+            }
+        })
+    });
 
     // Create shutdown signal from daemon handle
     let shutdown_signal = async move {
@@ -79,13 +113,16 @@ pub async fn run_grpc_server(
 
             match rx.recv().await {
                 Ok(DaemonEvent::ShutdownRequested) => break,
-                Ok(_) => continue,
+                Ok(_) => {}
                 Err(_) => break, // Channel closed
             }
         }
-        if cleanup {
+        if let Some(handle) = socket_updater {
+            handle.abort();
+        }
+        if let Some(path) = cleanup_path {
             eprintln!("Removing socket...");
-            if let Err(e) = std::fs::remove_file(&socket_path)
+            if let Err(e) = std::fs::remove_file(path)
                 && e.kind() != std::io::ErrorKind::NotFound
             {
                 eprintln!("failed to remove socket: {e}");
@@ -101,7 +138,7 @@ pub async fn run_grpc_server(
         if let Err(e) = Server::builder()
             .add_service(history_service)
             .add_service(search_service)
-            .add_service(control_service)
+            .add_service(ai_session_service)
             .serve_with_incoming_shutdown(uds_stream, shutdown_signal)
             .await
         {
@@ -115,10 +152,10 @@ pub async fn run_grpc_server(
 /// Run the gRPC server with the given services (Windows/TCP version).
 #[cfg(not(unix))]
 pub async fn run_grpc_server(
-    settings: Settings,
-    history_service: HistoryServer<HistoryGrpcService>,
+    settings: &Settings,
+    history_service: HistoryServer<grpc::HistoryService>,
     search_service: SearchServer<SearchGrpcService>,
-    control_service: ControlServer<ControlService>,
+    ai_session_service: AiSessionServer<grpc::AiSessionService>,
     handle: DaemonHandle,
 ) -> Result<()> {
     use tokio::net::TcpListener;
@@ -140,7 +177,7 @@ pub async fn run_grpc_server(
         loop {
             match rx.recv().await {
                 Ok(DaemonEvent::ShutdownRequested) => break,
-                Ok(_) => continue,
+                Ok(_) => {}
                 Err(_) => break, // Channel closed
             }
         }
@@ -152,7 +189,7 @@ pub async fn run_grpc_server(
         if let Err(e) = Server::builder()
             .add_service(history_service)
             .add_service(search_service)
-            .add_service(control_service)
+            .add_service(ai_session_service)
             .serve_with_incoming_shutdown(tcp_stream, shutdown_signal)
             .await
         {

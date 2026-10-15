@@ -27,9 +27,11 @@ pub enum ConditionAtom {
 /// - `"cursor-at-start && input-empty"` (conjunction)
 /// - `"list-at-start || no-results"` (disjunction)
 /// - `"(cursor-at-start && !input-empty) || no-results"` (grouping)
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, derive_more::From)]
 pub enum ConditionExpr {
+    #[from]
     Atom(ConditionAtom),
+    #[from(skip)]
     Not(Box<ConditionExpr>),
     And(Box<ConditionExpr>, Box<ConditionExpr>),
     Or(Box<ConditionExpr>, Box<ConditionExpr>),
@@ -37,6 +39,7 @@ pub enum ConditionExpr {
 
 /// Context needed to evaluate conditions. This is a pure snapshot of state —
 /// no references to mutable data.
+#[derive(Clone, Copy, PartialEq, Eq)]
 pub struct EvalContext {
     /// Current cursor position (unicode width units).
     pub cursor_position: usize,
@@ -133,12 +136,6 @@ impl ConditionExpr {
 // ---------------------------------------------------------------------------
 // ConditionExpr — ergonomic builders
 // ---------------------------------------------------------------------------
-
-impl From<ConditionAtom> for ConditionExpr {
-    fn from(atom: ConditionAtom) -> Self {
-        ConditionExpr::Atom(atom)
-    }
-}
 
 #[allow(dead_code)]
 impl ConditionExpr {
@@ -263,7 +260,7 @@ impl<'a> ExprParser<'a> {
         }
     }
 
-    /// atom = [a-z][a-z0-9-]*
+    /// atom = `[a-z][a-z0-9-]*`
     fn parse_atom(&mut self) -> Result<ConditionExpr, String> {
         self.skip_whitespace();
         let start = self.pos;
@@ -373,6 +370,8 @@ impl<'de> Deserialize<'de> for ConditionExpr {
 
 #[cfg(test)]
 mod tests {
+    use rstest::rstest;
+
     use super::*;
 
     fn ctx(
@@ -406,26 +405,26 @@ mod tests {
 
     // -- Atom evaluation (carried over from Phase 0) --
 
-    #[test]
+    #[rstest]
     fn atom_cursor_at_start() {
         assert!(ConditionAtom::CursorAtStart.evaluate(&ctx(0, 5, 5, 0, 10)));
         assert!(!ConditionAtom::CursorAtStart.evaluate(&ctx(3, 5, 5, 0, 10)));
     }
 
-    #[test]
+    #[rstest]
     fn atom_cursor_at_end() {
         assert!(ConditionAtom::CursorAtEnd.evaluate(&ctx(5, 5, 5, 0, 10)));
         assert!(!ConditionAtom::CursorAtEnd.evaluate(&ctx(3, 5, 5, 0, 10)));
         assert!(ConditionAtom::CursorAtEnd.evaluate(&ctx(0, 0, 0, 0, 10)));
     }
 
-    #[test]
+    #[rstest]
     fn atom_input_empty() {
         assert!(ConditionAtom::InputEmpty.evaluate(&ctx(0, 0, 0, 0, 10)));
         assert!(!ConditionAtom::InputEmpty.evaluate(&ctx(0, 5, 5, 0, 10)));
     }
 
-    #[test]
+    #[rstest]
     fn atom_original_input_empty() {
         // original_input_empty = true
         assert!(
@@ -441,21 +440,21 @@ mod tests {
         );
     }
 
-    #[test]
+    #[rstest]
     fn atom_list_at_end() {
         assert!(ConditionAtom::ListAtEnd.evaluate(&ctx(0, 0, 0, 99, 100)));
         assert!(!ConditionAtom::ListAtEnd.evaluate(&ctx(0, 0, 0, 50, 100)));
         assert!(ConditionAtom::ListAtEnd.evaluate(&ctx(0, 0, 0, 0, 0)));
     }
 
-    #[test]
+    #[rstest]
     fn atom_list_at_start() {
         assert!(ConditionAtom::ListAtStart.evaluate(&ctx(0, 0, 0, 0, 100)));
         assert!(!ConditionAtom::ListAtStart.evaluate(&ctx(0, 0, 0, 50, 100)));
         assert!(ConditionAtom::ListAtStart.evaluate(&ctx(0, 0, 0, 0, 0)));
     }
 
-    #[test]
+    #[rstest]
     fn atom_no_results_and_has_results() {
         assert!(ConditionAtom::NoResults.evaluate(&ctx(0, 0, 0, 0, 0)));
         assert!(!ConditionAtom::NoResults.evaluate(&ctx(0, 0, 0, 0, 5)));
@@ -463,7 +462,7 @@ mod tests {
         assert!(!ConditionAtom::HasResults.evaluate(&ctx(0, 0, 0, 0, 0)));
     }
 
-    #[test]
+    #[rstest]
     fn atom_has_context() {
         let mut context = ctx(0, 0, 0, 0, 0);
         assert!(!ConditionAtom::HasContext.evaluate(&context));
@@ -471,132 +470,94 @@ mod tests {
         assert!(ConditionAtom::HasContext.evaluate(&context));
     }
 
-    #[test]
-    fn atom_parse_round_trip() {
-        let conditions = [
-            "cursor-at-start",
-            "cursor-at-end",
-            "input-empty",
-            "original-input-empty",
-            "list-at-end",
-            "list-at-start",
-            "no-results",
-            "has-results",
-        ];
-        for s in conditions {
-            let c = ConditionAtom::from_str(s).unwrap();
-            assert_eq!(c.as_str(), s);
-        }
+    #[rstest]
+    #[case::cursor_at_start("cursor-at-start")]
+    #[case::cursor_at_end("cursor-at-end")]
+    #[case::input_empty("input-empty")]
+    #[case::original_input_empty("original-input-empty")]
+    #[case::list_at_end("list-at-end")]
+    #[case::list_at_start("list-at-start")]
+    #[case::no_results("no-results")]
+    #[case::has_results("has-results")]
+    fn atom_parse_round_trip(#[case] s: &str) {
+        let c = ConditionAtom::from_str(s).unwrap();
+        assert_eq!(c.as_str(), s);
     }
 
-    #[test]
+    #[rstest]
     fn atom_parse_unknown() {
         assert!(ConditionAtom::from_str("unknown-condition").is_err());
     }
 
     // -- Parser tests --
 
-    #[test]
-    fn parse_bare_atom() {
-        let expr = ConditionExpr::parse("cursor-at-start").unwrap();
-        assert_eq!(expr, ConditionExpr::Atom(ConditionAtom::CursorAtStart));
-    }
-
-    #[test]
-    fn parse_negation() {
-        let expr = ConditionExpr::parse("!no-results").unwrap();
-        assert_eq!(
-            expr,
-            ConditionExpr::Not(Box::new(ConditionExpr::Atom(ConditionAtom::NoResults)))
-        );
-    }
-
-    #[test]
-    fn parse_double_negation() {
-        let expr = ConditionExpr::parse("!!no-results").unwrap();
-        assert_eq!(
-            expr,
-            ConditionExpr::Not(Box::new(ConditionExpr::Not(Box::new(ConditionExpr::Atom(
-                ConditionAtom::NoResults
-            )))))
-        );
-    }
-
-    #[test]
-    fn parse_and() {
-        let expr = ConditionExpr::parse("cursor-at-start && input-empty").unwrap();
-        assert_eq!(
-            expr,
-            ConditionExpr::And(
+    #[rstest]
+    #[case::bare_atom("cursor-at-start", ConditionExpr::Atom(ConditionAtom::CursorAtStart))]
+    #[case::negation(
+        "!no-results",
+        ConditionExpr::Not(Box::new(ConditionExpr::Atom(ConditionAtom::NoResults)))
+    )]
+    #[case::double_negation(
+        "!!no-results",
+        ConditionExpr::Not(Box::new(ConditionExpr::Not(Box::new(ConditionExpr::Atom(
+            ConditionAtom::NoResults
+        )))))
+    )]
+    #[case::and(
+        "cursor-at-start && input-empty",
+        ConditionExpr::And(
+            Box::new(ConditionExpr::Atom(ConditionAtom::CursorAtStart)),
+            Box::new(ConditionExpr::Atom(ConditionAtom::InputEmpty)),
+        )
+    )]
+    #[case::or(
+        "list-at-start || no-results",
+        ConditionExpr::Or(
+            Box::new(ConditionExpr::Atom(ConditionAtom::ListAtStart)),
+            Box::new(ConditionExpr::Atom(ConditionAtom::NoResults)),
+        )
+    )]
+    // "a || b && c" should parse as "a || (b && c)"
+    #[case::precedence_and_binds_tighter_than_or(
+        "cursor-at-start || input-empty && no-results",
+        ConditionExpr::Or(
+            Box::new(ConditionExpr::Atom(ConditionAtom::CursorAtStart)),
+            Box::new(ConditionExpr::And(
+                Box::new(ConditionExpr::Atom(ConditionAtom::InputEmpty)),
+                Box::new(ConditionExpr::Atom(ConditionAtom::NoResults)),
+            )),
+        )
+    )]
+    // "(a || b) && c"
+    #[case::parens_override_precedence(
+        "(cursor-at-start || input-empty) && no-results",
+        ConditionExpr::And(
+            Box::new(ConditionExpr::Or(
                 Box::new(ConditionExpr::Atom(ConditionAtom::CursorAtStart)),
                 Box::new(ConditionExpr::Atom(ConditionAtom::InputEmpty)),
-            )
-        );
-    }
-
-    #[test]
-    fn parse_or() {
-        let expr = ConditionExpr::parse("list-at-start || no-results").unwrap();
-        assert_eq!(
-            expr,
-            ConditionExpr::Or(
-                Box::new(ConditionExpr::Atom(ConditionAtom::ListAtStart)),
-                Box::new(ConditionExpr::Atom(ConditionAtom::NoResults)),
-            )
-        );
-    }
-
-    #[test]
-    fn parse_precedence_and_binds_tighter_than_or() {
-        // "a || b && c" should parse as "a || (b && c)"
-        let expr = ConditionExpr::parse("cursor-at-start || input-empty && no-results").unwrap();
-        assert_eq!(
-            expr,
-            ConditionExpr::Or(
+            )),
+            Box::new(ConditionExpr::Atom(ConditionAtom::NoResults)),
+        )
+    )]
+    // "(a && !b) || c"
+    #[case::complex_nested(
+        "(cursor-at-start && !input-empty) || no-results",
+        ConditionExpr::Or(
+            Box::new(ConditionExpr::And(
                 Box::new(ConditionExpr::Atom(ConditionAtom::CursorAtStart)),
-                Box::new(ConditionExpr::And(
-                    Box::new(ConditionExpr::Atom(ConditionAtom::InputEmpty)),
-                    Box::new(ConditionExpr::Atom(ConditionAtom::NoResults)),
-                )),
-            )
-        );
+                Box::new(ConditionExpr::Not(Box::new(ConditionExpr::Atom(
+                    ConditionAtom::InputEmpty
+                )))),
+            )),
+            Box::new(ConditionExpr::Atom(ConditionAtom::NoResults)),
+        )
+    )]
+    fn parses_condition(#[case] input: &str, #[case] expected: ConditionExpr) {
+        let expr = ConditionExpr::parse(input).unwrap();
+        assert_eq!(expr, expected);
     }
 
-    #[test]
-    fn parse_parens_override_precedence() {
-        // "(a || b) && c"
-        let expr = ConditionExpr::parse("(cursor-at-start || input-empty) && no-results").unwrap();
-        assert_eq!(
-            expr,
-            ConditionExpr::And(
-                Box::new(ConditionExpr::Or(
-                    Box::new(ConditionExpr::Atom(ConditionAtom::CursorAtStart)),
-                    Box::new(ConditionExpr::Atom(ConditionAtom::InputEmpty)),
-                )),
-                Box::new(ConditionExpr::Atom(ConditionAtom::NoResults)),
-            )
-        );
-    }
-
-    #[test]
-    fn parse_complex_nested() {
-        // "(a && !b) || c"
-        let expr = ConditionExpr::parse("(cursor-at-start && !input-empty) || no-results").unwrap();
-        assert_eq!(
-            expr,
-            ConditionExpr::Or(
-                Box::new(ConditionExpr::And(
-                    Box::new(ConditionExpr::Atom(ConditionAtom::CursorAtStart)),
-                    Box::new(ConditionExpr::Not(Box::new(ConditionExpr::Atom(
-                        ConditionAtom::InputEmpty
-                    )))),
-                )),
-                Box::new(ConditionExpr::Atom(ConditionAtom::NoResults)),
-            )
-        );
-    }
-
-    #[test]
+    #[rstest]
     fn parse_whitespace_tolerance() {
         let a = ConditionExpr::parse("cursor-at-start||input-empty").unwrap();
         let b = ConditionExpr::parse("cursor-at-start || input-empty").unwrap();
@@ -605,29 +566,18 @@ mod tests {
         assert_eq!(b, c);
     }
 
-    #[test]
-    fn parse_error_unknown_atom() {
-        assert!(ConditionExpr::parse("unknown-thing").is_err());
-    }
-
-    #[test]
-    fn parse_error_trailing_input() {
-        assert!(ConditionExpr::parse("cursor-at-start blah").is_err());
-    }
-
-    #[test]
-    fn parse_error_unmatched_paren() {
-        assert!(ConditionExpr::parse("(cursor-at-start").is_err());
-    }
-
-    #[test]
-    fn parse_error_empty() {
-        assert!(ConditionExpr::parse("").is_err());
+    #[rstest]
+    #[case::unknown_atom("unknown-thing")]
+    #[case::trailing_input("cursor-at-start blah")]
+    #[case::unmatched_paren("(cursor-at-start")]
+    #[case::empty("")]
+    fn rejects_invalid_condition(#[case] input: &str) {
+        assert!(ConditionExpr::parse(input).is_err());
     }
 
     // -- Expression evaluation --
 
-    #[test]
+    #[rstest]
     fn eval_not() {
         let expr = ConditionExpr::parse("!no-results").unwrap();
         // Has results → !no-results is true
@@ -636,7 +586,7 @@ mod tests {
         assert!(!expr.evaluate(&ctx(0, 0, 0, 0, 0)));
     }
 
-    #[test]
+    #[rstest]
     fn eval_and() {
         let expr = ConditionExpr::parse("cursor-at-start && input-empty").unwrap();
         // Both true
@@ -647,7 +597,7 @@ mod tests {
         assert!(!expr.evaluate(&ctx(3, 5, 5, 0, 10)));
     }
 
-    #[test]
+    #[rstest]
     fn eval_or() {
         let expr = ConditionExpr::parse("list-at-start || no-results").unwrap();
         // list at bottom (selected=0)
@@ -658,7 +608,7 @@ mod tests {
         assert!(!expr.evaluate(&ctx(0, 0, 0, 5, 10)));
     }
 
-    #[test]
+    #[rstest]
     fn eval_complex_nested() {
         // (cursor-at-start && !input-empty) || no-results
         let expr = ConditionExpr::parse("(cursor-at-start && !input-empty) || no-results").unwrap();
@@ -675,79 +625,60 @@ mod tests {
 
     // -- Display --
 
-    #[test]
-    fn display_atom() {
-        let expr = ConditionExpr::Atom(ConditionAtom::CursorAtStart);
-        assert_eq!(expr.to_string(), "cursor-at-start");
+    #[rstest]
+    #[case::atom(ConditionExpr::Atom(ConditionAtom::CursorAtStart), "cursor-at-start")]
+    #[case::not(ConditionExpr::Atom(ConditionAtom::NoResults).not(), "!no-results")]
+    #[case::and(
+        ConditionExpr::Atom(ConditionAtom::CursorAtStart)
+            .and(ConditionExpr::Atom(ConditionAtom::InputEmpty)),
+        "cursor-at-start && input-empty"
+    )]
+    #[case::or(
+        ConditionExpr::Atom(ConditionAtom::ListAtStart)
+            .or(ConditionExpr::Atom(ConditionAtom::NoResults)),
+        "list-at-start || no-results"
+    )]
+    fn displays_condition(#[case] expr: ConditionExpr, #[case] expected: &str) {
+        assert_eq!(expr.to_string(), expected);
     }
 
-    #[test]
-    fn display_not() {
-        let expr = ConditionExpr::Atom(ConditionAtom::NoResults).not();
-        assert_eq!(expr.to_string(), "!no-results");
-    }
-
-    #[test]
-    fn display_and() {
-        let expr = ConditionExpr::Atom(ConditionAtom::CursorAtStart)
-            .and(ConditionExpr::Atom(ConditionAtom::InputEmpty));
-        assert_eq!(expr.to_string(), "cursor-at-start && input-empty");
-    }
-
-    #[test]
-    fn display_or() {
-        let expr = ConditionExpr::Atom(ConditionAtom::ListAtStart)
-            .or(ConditionExpr::Atom(ConditionAtom::NoResults));
-        assert_eq!(expr.to_string(), "list-at-start || no-results");
-    }
-
-    #[test]
+    #[rstest]
     fn display_parens_when_needed() {
         // (a || b) && c — the Or inside And needs parens
         let expr = ConditionExpr::Atom(ConditionAtom::CursorAtStart)
             .or(ConditionExpr::Atom(ConditionAtom::InputEmpty))
             .and(ConditionExpr::Atom(ConditionAtom::NoResults));
-        assert_eq!(
-            expr.to_string(),
-            "(cursor-at-start || input-empty) && no-results"
-        );
+        assert_eq!(expr.to_string(), "(cursor-at-start || input-empty) && no-results");
     }
 
-    #[test]
+    #[rstest]
     fn display_no_parens_when_not_needed() {
         // a || b && c — no parens needed (and binds tighter)
         let inner_and = ConditionExpr::Atom(ConditionAtom::InputEmpty)
             .and(ConditionExpr::Atom(ConditionAtom::NoResults));
         let expr = ConditionExpr::Atom(ConditionAtom::CursorAtStart).or(inner_and);
-        assert_eq!(
-            expr.to_string(),
-            "cursor-at-start || input-empty && no-results"
-        );
+        assert_eq!(expr.to_string(), "cursor-at-start || input-empty && no-results");
     }
 
     // -- Display round-trip --
 
-    #[test]
-    fn display_round_trip() {
-        let cases = [
-            "cursor-at-start",
-            "!no-results",
-            "cursor-at-start && input-empty",
-            "list-at-start || no-results",
-            "(cursor-at-start || input-empty) && no-results",
-            "(cursor-at-start && !input-empty) || no-results",
-        ];
-        for s in cases {
-            let expr = ConditionExpr::parse(s).unwrap();
-            let displayed = expr.to_string();
-            let reparsed = ConditionExpr::parse(&displayed).unwrap();
-            assert_eq!(expr, reparsed, "round-trip failed for: {s}");
-        }
+    #[rstest]
+    #[case::atom("cursor-at-start")]
+    #[case::not("!no-results")]
+    #[case::and("cursor-at-start && input-empty")]
+    #[case::or("list-at-start || no-results")]
+    #[case::parenthesized_or_in_and("(cursor-at-start || input-empty) && no-results")]
+    #[case::parenthesized_and_in_or("(cursor-at-start && !input-empty) || no-results")]
+    fn display_round_trip(#[case] s: &str) {
+        let expr = ConditionExpr::parse(s).unwrap();
+        let displayed = expr.to_string();
+        let reparsed = ConditionExpr::parse(&displayed).unwrap();
+        assert_eq!(expr, reparsed, "round-trip failed for: {s}");
     }
 
     // -- Serde --
 
-    #[test]
+    #[rstest]
     fn serde_simple_atom() {
         let expr = ConditionExpr::Atom(ConditionAtom::CursorAtStart);
         let json = serde_json::to_string(&expr).unwrap();
@@ -756,20 +687,18 @@ mod tests {
         assert_eq!(parsed, expr);
     }
 
-    #[test]
+    #[rstest]
     fn serde_compound_expression() {
         let json = "\"cursor-at-start && !input-empty\"";
         let parsed: ConditionExpr = serde_json::from_str(json).unwrap();
         let expected = ConditionExpr::And(
             Box::new(ConditionExpr::Atom(ConditionAtom::CursorAtStart)),
-            Box::new(ConditionExpr::Not(Box::new(ConditionExpr::Atom(
-                ConditionAtom::InputEmpty,
-            )))),
+            Box::new(ConditionExpr::Not(Box::new(ConditionExpr::Atom(ConditionAtom::InputEmpty)))),
         );
         assert_eq!(parsed, expected);
     }
 
-    #[test]
+    #[rstest]
     fn serde_round_trip() {
         let expr = ConditionExpr::parse("(cursor-at-start && !input-empty) || no-results").unwrap();
         let json = serde_json::to_string(&expr).unwrap();
@@ -779,7 +708,7 @@ mod tests {
 
     // -- From<ConditionAtom> --
 
-    #[test]
+    #[rstest]
     fn from_atom_into_expr() {
         let expr: ConditionExpr = ConditionAtom::CursorAtStart.into();
         assert_eq!(expr, ConditionExpr::Atom(ConditionAtom::CursorAtStart));
@@ -787,15 +716,12 @@ mod tests {
 
     // -- Builder helpers --
 
-    #[test]
+    #[rstest]
     fn builder_chain() {
         let expr = ConditionExpr::from(ConditionAtom::CursorAtStart)
             .and(ConditionExpr::from(ConditionAtom::InputEmpty).not())
             .or(ConditionExpr::from(ConditionAtom::NoResults));
         // And binds tighter than Or, so no parens needed around the And
-        assert_eq!(
-            expr.to_string(),
-            "cursor-at-start && !input-empty || no-results"
-        );
+        assert_eq!(expr.to_string(), "cursor-at-start && !input-empty || no-results");
     }
 }

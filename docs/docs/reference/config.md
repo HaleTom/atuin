@@ -4,7 +4,7 @@
 
 Read, write, and inspect Atuin configuration values. Atuin resolves
 configuration from multiple sources (defaults, config file, environment
-variables). The `config` command lets you see what is set where, and change
+variables). The `config` command lets you see what's set where, and change
 values in your `config.toml` without opening an editor.
 
 ## Subcommands
@@ -13,7 +13,7 @@ values in your `config.toml` without opening an editor.
 
 Print the value of a key as it appears in your config file.
 
-```
+```console
 $ atuin config get search_mode
 fuzzy
 
@@ -23,9 +23,9 @@ enabled = true
 socket_path = "/tmp/atuin_daemon.sock"
 ```
 
-If the key is not present in the config file, you'll see:
+If the key isn't present in the config file, you'll see:
 
-```
+```console
 $ atuin config get enter_accept
 (not set in config file)
 ```
@@ -35,7 +35,7 @@ $ atuin config get enter_accept
 Print the effective value after merging defaults, the config file, and
 environment variable overrides:
 
-```
+```console
 $ atuin config get enter_accept --resolved
 false
 ```
@@ -43,11 +43,11 @@ false
 This also works for table keys, showing all resolved children as flat
 dotted key=value pairs:
 
-```
+```console
 $ atuin config get logs --resolved
 logs.ai.file = ai.log
 logs.daemon.file = daemon.log
-logs.dir = /home/user/.local/share/atuin/logs
+logs.dir = /home/user/.atuin/logs
 logs.enabled = true
 logs.level = info
 logs.search.file = search.log
@@ -57,7 +57,7 @@ logs.search.file = search.log
 
 Show both the config file value and the resolved value side by side:
 
-```
+```console
 $ atuin config get enter_accept --verbose
 Config file:
   (not set in config file)
@@ -71,7 +71,7 @@ Resolved:
 Set a configuration value in your `config.toml`. The file's existing
 formatting and comments are preserved.
 
-```
+```shell
 $ atuin config set search_mode fuzzy
 $ atuin config set daemon.enabled true
 ```
@@ -82,7 +82,7 @@ By default, `set` matches the TOML type of the existing value when the key
 is already in the config file. This prevents accidentally changing a string
 like `"300"` into an integer `300`.
 
-For new keys (not already in the file), `set` auto-detects the type:
+For new keys (not already in the file), `set` automatically detects the type:
 
 | Value         | Detected type |
 |---------------|---------------|
@@ -92,32 +92,69 @@ For new keys (not already in the file), `set` auto-detects the type:
 | anything else | string        |
 
 !!! warning "Scalar values only"
-    `atuin config set` can only set config entries with scalar values; for tables or arrays, edit the config file manually.
+    `atuin config set` can only set config entries with scalar values, so for tables or arrays, edit the config file manually.
 
 #### `--type` / `-t`
 
 Override type detection with an explicit type:
 
-```
+```shell
 $ atuin config set sync_frequency 600 --type string
 ```
 
 Possible values: `auto`, `string`, `boolean`, `integer`, `float`.
 
-Setting a key that is currently a table will produce an error directing you
+Setting a key that's currently a table will produce an error directing you
 to use a dotted key instead:
 
-```
+```console
 $ atuin config set logs true
 Error: 'logs' is a table; use a dotted key like 'logs.key' to set a value within it
 ```
+
+### `atuin config enable <feature>`
+
+Turn on a feature along with the settings it depends on, then restart the
+daemon so it takes effect.
+
+```shell
+$ atuin config enable output-capture
+```
+
+| Feature | What it sets |
+| ------- | ------------ |
+| `daemon` | `daemon.enabled`, `daemon.autostart`, and `search_mode = "daemon-fuzzy"` |
+| `output-capture` | `daemon.enabled`, `daemon.autostart`, `pty_proxy.enabled`, and `output.enabled`. See [Capturing Command Output](../guide/output-capture.md) |
+
+If the daemon is already enabled, its `autostart` is left alone, since a
+service manager such as systemd or `launchd` may run it. With `autostart` off,
+Atuin asks you to restart the daemon rather than doing it itself. Open a new
+shell afterward.
+
+### `atuin config disable <feature>`
+
+Turn off a feature.
+
+```shell
+$ atuin config disable output-capture
+```
+
+| Feature          | What it sets                                                                                                 |
+|------------------|--------------------------------------------------------------------------------------------------------------|
+| `daemon`         | `daemon.enabled = false`, `daemon.autostart = false`, and `search_mode = "fuzzy"` if it was `"daemon-fuzzy"` |
+| `output-capture` | `output.enabled = false`. Leaves the daemon and search mode unchanged                                        |
+
+Disabling the daemon stops it if it was running.
+
+Disabling output capture restarts an enabled daemon with `autostart` on so
+it picks up the change. Open a new shell afterward.
 
 ### `atuin config print [key]`
 
 Print configuration values from your config file in TOML format. Without a
 key, prints the entire file. With a key, prints that section:
 
-```
+```console
 $ atuin config print daemon
 [daemon]
 enabled = true
